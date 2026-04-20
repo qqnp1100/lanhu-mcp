@@ -54,7 +54,7 @@ LANHU_COOKIE="$LANHU_COOKIE"
 # ==============================================
 
 # 服务器主机地址
-SERVER_HOST="0.0.0.0"
+SERVER_HOST="127.0.0.1"
 
 # 服务器端口
 SERVER_PORT=8000

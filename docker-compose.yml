@@ -17,7 +17,7 @@ services:
     environment:
       # 这些环境变量会覆盖 .env 文件中的配置
       # 如果不需要覆盖，可以删除这些行
-      - SERVER_HOST=0.0.0.0
+      - SERVER_HOST=127.0.0.1
       - SERVER_PORT=8000
       # LANHU_COOKIE 从 .env 文件读取
       # FEISHU_WEBHOOK_URL 从 .env 文件读取（可选）
@@ -80,3 +80,8 @@ services:
 #     - 重启服务：docker-compose restart lanhu-mcp
 #
 
+#     net stop winnat
+#     docker start container_name
+#     net start winnat
+
+# $OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8

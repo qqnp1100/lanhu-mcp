@@ -41,14 +41,14 @@ echo # 必需配置
 echo # ==============================================
 echo.
 echo # 蓝湖 Cookie（必需）
-echo LANHU_COOKIE="your_lanhu_cookie_here"
+echo LANHU_COOKIE="_ga=GA1.1.1604863826.1745571085; _ga_80BGNFFJQN=GS2.1.s1750057473$o3$g0$t1750057475$j58$l0$h0; tfstk=gb0tHRMZ3pvi4p8BeNxHiQ9GIEAHKHca9Al5o-2GcvHKLxEmn5xZGjwK3Rqg5R2jHJw4ClxZjmHKQvrijqhVkSGj3CyD_HcZ_rzXELDvrflwxzKZep4XGXa0MPPShhlZ_r5eGlXZ6f8vI-dbhrMbRkNz6r__1xZQAJP4GONf5BhQLJNbGGwfR9N4N16jhrOKOJPbl-MbfBhQLSabhbspHJ1_nZndMn1qfw2NlZgL6ktn1J_UG2FTf8GsWZ_fN5ETFfwpBrMQVkG4Dq5Vkohs4xPSCO9Y32hI50MWKG2s2ShoDfT1RP0Z10ZjPKSjsP2TRViRGZGLWJHrlvW9p8gZO4zQxUO-O2ki_2hcGENnEJGZ5rLWaPU_CyFEop7_HDijSlzVCKeqJXgsDg-sr4LCXT28iGOp9iS4fWorA1D0YnCS0Wek6EIV0kRU98Ap9isfhBPLECdA0ireT; user_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE4MDQyMjc3ODEsImlkIjoiZDBhYjkzMDctZGU2NC00YmRmLTgxNDktOWM1ZjRlYmIzYTM1In0.jiovg6zYbmYlSbWvrPqUXfYR8Qwd3f-lYeZlar-v2zw; session=.eJyMkE2KG0EMRu9SazdI1Sr9-DKNVFLNmCSO6fGQRcjdgxmyz_JbPHjf-92OddbHe7s-z8-6tOOW7dqClAmhD840cogoIk1LqXCGRSYm1XfCXUfWMK5yAZYgcCXUQT0G4-SsANepsDqMQZlZnd16t4EWUbmgR6woELJkfTHI7dKOR50__F735z-17z_fbvdjvtf8tiV42A6yZTFtFLk2RbLN5lhUEbvvo12bGMcKxn04jcqJNRWnisIOXsbHcaBIZ0MRG-M1QUQF1_C-64SZVrhEdSoKofV2aY9feazb_a3Ox3l76TWkAnEAhViTu3ZJLC0bUAai2i7tefqsr7h9eK2UsQGBb6SLt7CAzbgnYpAbebu0z486v4D_OvvnbwAAAP__lJqAzA.aa4rww.8IDO-XlpuLEok6Z9QuROS6myzVo"
 echo.
 echo # ==============================================
 echo # 服务器配置（可选）
 echo # ==============================================
 echo.
 echo # 服务器主机地址
-echo SERVER_HOST="0.0.0.0"
+echo SERVER_HOST="127.0.0.1"
 echo.
 echo # 服务器端口
 echo SERVER_PORT=8000
