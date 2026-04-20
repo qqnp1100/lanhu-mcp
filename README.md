@@ -4,7 +4,7 @@
 
 **让所有 AI 助手共享团队知识，打破 AI IDE 孤岛**
 
-**lanhumcp | 蓝湖mcp | lanhu-mcp | 蓝湖AI助手 | Lanhu AI Integration**
+**lanhumcp | 蓝湖mcp | lanhu-mcp | 蓝湖AI助手 | 蓝湖skills | Lanhu AI Integration**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -20,10 +20,10 @@
 
 [快速开始](#-快速开始) • [功能特性](#-核心特性) • [使用文档](#-使用指南) • [贡献指南](CONTRIBUTING.md)
 
+
 </div>
 
 ---
-
 
 ## 🌟 项目亮点
 
@@ -111,7 +111,6 @@
 - **智能缓存**：基于文档版本号的永久缓存机制
 - **增量更新**：只下载变更的资源
 - **并发处理**：支持批量页面截图和资源下载
-
 ## 🚀 快速开始
 
 > ⚠️ **重要提示：必须使用支持视觉功能的AI模型！**
@@ -130,9 +129,9 @@
 
 > 💡 **小白用户？** 直接对 AI 说 "帮我克隆并安装 https://github.com/dsphper/lanhu-mcp 项目"，AI 会引导你完成所有步骤！
 
-### 方式一：让 AI 帮你安装（推荐）
+### 方式一：让 AI 帮你安装（推荐！！！）
 
-直接在 Cursor 中对 AI 说：
+直接在对 AI 说：
 ```
 "帮我克隆并安装 https://github.com/dsphper/lanhu-mcp 项目"
 ```
@@ -280,6 +279,91 @@ docker-compose down              # 停止
 > - `name`: 用户姓名（用于协作追踪和 @提醒）
 > - ⚠️ **注意**：部分 AI 开发工具不支持 URL 中使用中文参数值，建议使用英文
 
+## 🎯 提升 UI 还原度
+
+开启蓝湖的**设计稿转代码**功能可以显著提升 UI 还原度。如果遇到提示无法转换的问题，需要让 UI 设计师升级蓝湖插件版本后重新上传设计稿。
+
+---
+
+## ✨保持关注
+
+给我们点个 Star，你将能第一时间从 GitHub 收到所有新版本的发布通知！
+<img width="900" alt="Screenshot 2025-06-02 at 3 03 49 PM" src="https://github.com/user-attachments/assets/1c9a3661-80a4-4fba-a30f-f469898b0aec" />
+## 📖 使用指南
+
+### 需求文档分析工作流
+
+**1. 获取页面列表**
+```
+请帮我用mcp看看这个需求文档：
+https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx
+```
+
+**2. AI 自动执行四阶段分析**
+- ✅ STAGE 1: 全局文本扫描，建立整体认知
+- ✅ STAGE 2: 分组详细分析（根据选择的模式）
+- ✅ STAGE 3: 反向验证，确保零遗漏
+- ✅ STAGE 4: 生成交付文档（需求文档/测试计划/评审PPT）
+
+**3. 获取交付物**
+- 开发视角：详细需求文档 + 全局业务流程图
+- 测试视角：测试计划 + 测试用例清单 + 字段校验表
+- 快速探索：评审文档 + 模块依赖图 + 讨论要点
+
+### UI 设计稿查看
+
+```
+请帮我用mcp看看这个设计稿：
+https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx
+```
+
+分析结果包含设计图预览、详细参数（尺寸/间距/颜色/字体等）以及转换后的 HTML+CSS 代码，便于还原实现。
+
+### 切图下载
+
+```
+帮我用mcp下载"首页设计"的所有切图
+```
+
+AI 会自动：
+1. 检测项目类型（React/Vue/Flutter 等）
+2. 选择合适的输出目录
+3. 生成语义化文件名
+4. 批量下载切图
+
+### 团队留言
+
+**发布留言：**
+```
+@张三 @李四 这个登录页面的密码校验规则需要确认一下
+```
+
+**查看留言：**
+```
+查看所有 @我的消息
+```
+
+**筛选查询：**
+```
+查看所有关于"测试"的知识库类型留言
+```
+
+## 🛠️ 可用工具列表
+
+| 工具名称 | 功能描述 | 使用场景 |
+|---------|---------|---------|
+| `lanhu_resolve_invite_link` | 解析邀请链接 | 用户提供分享链接时 |
+| `lanhu_get_pages` | 获取原型页面列表 | 分析需求文档前必调用 |
+| `lanhu_get_ai_analyze_page_result` | 分析原型页面内容 | 提取需求细节 |
+| `lanhu_get_designs` | 获取UI设计图列表 | 查看设计稿前必调用 |
+| `lanhu_get_ai_analyze_design_result` | 分析UI设计图 | 查看设计稿 |
+| `lanhu_get_design_slices` | 获取切图信息 | 下载图标、素材 |
+| `lanhu_say` | 发布留言 | 团队协作、@提醒 |
+| `lanhu_say_list` | 查看留言列表 | 查询历史消息 |
+| `lanhu_say_detail` | 查看留言详情 | 查看完整内容 |
+| `lanhu_say_edit` | 编辑留言 | 修改已发布消息 |
+| `lanhu_say_delete` | 删除留言 | 移除消息 |
+| `lanhu_get_members` | 查看协作者 | 查看团队成员 |
 ## 🎯 团队留言板：突破 AI 协作的最后一公里
 
 ### 为什么需要团队留言板？
@@ -524,81 +608,6 @@ lanhu_say(
 
 ---
 
-## 📖 使用指南
-
-### 需求文档分析工作流
-
-**1. 获取页面列表**
-```
-请帮我看看这个需求文档：
-https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx
-```
-
-**2. AI 自动执行四阶段分析**
-- ✅ STAGE 1: 全局文本扫描，建立整体认知
-- ✅ STAGE 2: 分组详细分析（根据选择的模式）
-- ✅ STAGE 3: 反向验证，确保零遗漏
-- ✅ STAGE 4: 生成交付文档（需求文档/测试计划/评审PPT）
-
-**3. 获取交付物**
-- 开发视角：详细需求文档 + 全局业务流程图
-- 测试视角：测试计划 + 测试用例清单 + 字段校验表
-- 快速探索：评审文档 + 模块依赖图 + 讨论要点
-
-### UI 设计稿查看
-
-```
-请帮我看看这个设计稿：
-https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx
-```
-
-分析结果包含设计图预览、详细参数（尺寸/间距/颜色/字体等）以及转换后的 HTML+CSS 代码，便于还原实现。
-
-### 切图下载
-
-```
-帮我下载"首页设计"的所有切图
-```
-
-AI 会自动：
-1. 检测项目类型（React/Vue/Flutter 等）
-2. 选择合适的输出目录
-3. 生成语义化文件名
-4. 批量下载切图
-
-### 团队留言
-
-**发布留言：**
-```
-@张三 @李四 这个登录页面的密码校验规则需要确认一下
-```
-
-**查看留言：**
-```
-查看所有 @我的消息
-```
-
-**筛选查询：**
-```
-查看所有关于"测试"的知识库类型留言
-```
-
-## 🛠️ 可用工具列表
-
-| 工具名称 | 功能描述 | 使用场景 |
-|---------|---------|---------|
-| `lanhu_resolve_invite_link` | 解析邀请链接 | 用户提供分享链接时 |
-| `lanhu_get_pages` | 获取原型页面列表 | 分析需求文档前必调用 |
-| `lanhu_get_ai_analyze_page_result` | 分析原型页面内容 | 提取需求细节 |
-| `lanhu_get_designs` | 获取UI设计图列表 | 查看设计稿前必调用 |
-| `lanhu_get_ai_analyze_design_result` | 分析UI设计图 | 查看设计稿 |
-| `lanhu_get_design_slices` | 获取切图信息 | 下载图标、素材 |
-| `lanhu_say` | 发布留言 | 团队协作、@提醒 |
-| `lanhu_say_list` | 查看留言列表 | 查询历史消息 |
-| `lanhu_say_detail` | 查看留言详情 | 查看完整内容 |
-| `lanhu_say_edit` | 编辑留言 | 修改已发布消息 |
-| `lanhu_say_delete` | 删除留言 | 移除消息 |
-| `lanhu_get_members` | 查看协作者 | 查看团队成员 |
 
 ## 🏗️ 系统架构
 
@@ -872,6 +881,7 @@ black lanhu_mcp_server.py
 
 - 提交 Issue: [GitHub Issues](https://github.com/dsphper/lanhu-mcp/issues)
 - 邮件: dsphper@gmail.com
+<p align="center"><img src="images/wechat.jpg?v=20260415" alt="微信群二维码" width="400" /></p>
 
 ## 🗺️ 路线图
 
@@ -901,7 +911,7 @@ black lanhu_mcp_server.py
 
 ## 🏷️ 标签 Tags
 
-`lanhumcp` `蓝湖mcp` `lanhu-mcp` `蓝湖AI` `lanhu-ai` `mcp-server` `cursor-plugin` `windsurf-integration` `claude-integration` `openclaw-integration` `clawbot-integration` `axure-automation` `requirement-analysis` `design-collaboration` `ai-development-tools` `model-context-protocol` `蓝湖插件` `蓝湖API` `OpenClaw` `ClawBot` `AI助手` `AI编程` `智能协作` `AI需求分析` `设计协作` `前端开发工具` `后端开发工具`
+`lanhumcp` `蓝湖mcp` `lanhu-mcp` `蓝湖AI` `蓝湖skills` `lanhu-skills` `cursor-skills` `agent-skills` `lanhu-ai` `mcp-server` `cursor-plugin` `windsurf-integration` `claude-integration` `openclaw-integration` `clawbot-integration` `axure-automation` `requirement-analysis` `design-collaboration` `ai-development-tools` `model-context-protocol` `蓝湖插件` `蓝湖API` `OpenClaw` `ClawBot` `AI助手` `AI编程` `智能协作` `AI需求分析` `设计协作` `前端开发工具` `后端开发工具`
 
 ---
 
@@ -923,16 +933,16 @@ black lanhu_mcp_server.py
 
 ## 🔍 SEO 关键词索引
 
-**中文关键词**: 蓝湖mcp | lanhumcp | 蓝湖AI | 蓝湖插件 | 蓝湖API | 蓝湖Cursor | 蓝湖Windsurf | 蓝湖Claude | 蓝湖OpenClaw | 蓝湖ClawBot | OpenClaw | ClawBot | OpenClaw集成 | ClawBot集成 | AI助手 | 蓝湖需求文档 | 蓝湖Axure | 蓝湖切图 | 蓝湖设计稿 | AI需求分析 | AI测试用例 | MCP服务器 | 模型上下文协议
+**中文关键词**: 蓝湖mcp | lanhumcp | 蓝湖AI | 蓝湖skills | 蓝湖Skill | Cursor Skills 蓝湖 | Agent Skills 蓝湖 | 蓝湖插件 | 蓝湖API | 蓝湖Cursor | 蓝湖Windsurf | 蓝湖Claude | 蓝湖OpenClaw | 蓝湖ClawBot | OpenClaw | ClawBot | OpenClaw集成 | ClawBot集成 | AI助手 | 蓝湖需求文档 | 蓝湖Axure | 蓝湖切图 | 蓝湖设计稿 | AI需求分析 | AI测试用例 | MCP服务器 | 模型上下文协议
 
-**English Keywords**: lanhu mcp | lanhu-mcp | lanhu ai | lanhu cursor | lanhu windsurf | lanhu claude | lanhu api | lanhu integration | lanhu openclaw | lanhu clawbot | openclaw mcp | clawbot mcp | mcp server | model context protocol | axure automation | design collaboration | requirement analysis | ai development tools
+**English Keywords**: lanhu mcp | lanhu-mcp | lanhu ai | lanhu skills | cursor skills lanhu | agent skills lanhu | lanhu cursor | lanhu windsurf | lanhu claude | lanhu api | lanhu integration | lanhu openclaw | lanhu clawbot | openclaw mcp | clawbot mcp | mcp server | model context protocol | axure automation | design collaboration | requirement analysis | ai development tools
 
 **适用人群**: 产品经理 | 前端开发 | 后端开发 | 测试工程师 | UI设计师 | 使用Cursor的开发者 | 使用Windsurf的开发者 | 使用Claude的开发者 | AI编程爱好者
 
 ---
 ## ⚠️ 免责声明
 
-本项目（Lanhu MCP Server）是一个**第三方开源项目**，由社区开发者独立开发和维护，**并非蓝湖（Lanhu）官方产品**。
+本项目（Lanhu MCP Server）是一个**第三方开源项目**，由社区开发者独立开发和维护，**并非蓝湖官方产品**。
 
 **重要说明：**
 - 本项目与蓝湖公司无任何官方关联或合作关系
@@ -953,4 +963,4 @@ black lanhu_mcp_server.py
 
 如有任何疑问或建议，欢迎通过 [GitHub Issues](https://github.com/dsphper/lanhu-mcp/issues) 与我们交流。
 
-<!-- Last checked: 2026-03-03 05:12 -->
+<!-- Last checked: 2026-04-20 02:32 -->

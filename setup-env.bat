@@ -1,5 +1,7 @@
 @echo off
+chcp 65001 >nul 2>&1
 REM 蓝湖 MCP Docker 快速部署脚本 (Windows)
+REM 适配 Docker Desktop v20.10+ (docker compose 无横线)
 REM 使用方法: setup-env.bat
 
 echo.
@@ -8,7 +10,7 @@ echo 🚀 蓝湖 MCP Server - Docker 部署助手
 echo ========================================
 echo.
 
-REM 检查 Docker
+REM 检查 Docker 基础环境
 echo 📦 检查 Docker 环境...
 docker --version >nul 2>&1
 if errorlevel 1 (
@@ -18,12 +20,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
-docker-compose --version >nul 2>&1
-if errorlevel 1 (
-    echo ❌ 未安装 Docker Compose，请先安装
-    echo    官方文档: https://docs.docker.com/compose/install/
-    pause
-    exit /b 1
+REM 兼容检测 docker-compose / docker compose
+echo 📦 检测 Docker Compose 命令格式...
+set "COMPOSE_CMD="
+docker compose version >nul 2>&1
+if not errorlevel 1 (
+    set "COMPOSE_CMD=docker compose"
+    echo ✅ 检测到 Docker Compose (无横线) 格式: docker compose
+) else (
+    docker-compose --version >nul 2>&1
+    if not errorlevel 1 (
+        set "COMPOSE_CMD=docker-compose"
+        echo ✅ 检测到 Docker Compose (有横线) 格式: docker-compose
+    ) else (
+        echo ❌ 未安装 Docker Compose，请先安装
+        echo    官方文档: https://docs.docker.com/compose/install/
+        pause
+        exit /b 1
+    )
 )
 
 echo ✅ Docker 环境检查通过
@@ -101,11 +115,11 @@ echo.
 REM 构建和启动
 echo 🏗️  构建 Docker 镜像...
 echo ⏳ 这可能需要几分钟时间，请耐心等待...
-docker-compose build
+%COMPOSE_CMD% build
 
 echo.
 echo 🚀 启动服务...
-docker-compose up -d
+%COMPOSE_CMD% up -d
 
 echo.
 echo ⏱️  等待服务启动（10秒）...
@@ -114,12 +128,12 @@ timeout /t 10 /nobreak >nul
 REM 检查服务状态
 echo.
 echo 🔍 检查服务状态...
-docker-compose ps | findstr "Up" >nul
+%COMPOSE_CMD% ps | findstr "Up" >nul
 if not errorlevel 1 (
     echo ✅ 服务启动成功！
     echo.
     echo 📊 服务信息:
-    docker-compose ps
+    %COMPOSE_CMD% ps
     echo.
     echo ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     echo 🎉 部署完成！
@@ -129,10 +143,10 @@ if not errorlevel 1 (
     echo    http://localhost:8000/mcp?role=开发^&name=你的名字
     echo.
     echo 🔧 常用命令:
-    echo    查看日志: docker-compose logs -f lanhu-mcp
-    echo    停止服务: docker-compose stop
-    echo    重启服务: docker-compose restart
-    echo    删除服务: docker-compose down
+    echo    查看日志: %COMPOSE_CMD% logs -f lanhu-mcp
+    echo    停止服务: %COMPOSE_CMD% stop
+    echo    重启服务: %COMPOSE_CMD% restart
+    echo    删除服务: %COMPOSE_CMD% down
     echo.
     echo 📚 配置 AI 客户端:
     echo    请参考 DEPLOY.md 文档中的「连接 AI 客户端」章节
@@ -146,13 +160,14 @@ if not errorlevel 1 (
     echo ❌ 服务启动失败
     echo.
     echo 📋 查看错误日志:
-    docker-compose logs --tail=50 lanhu-mcp
+    %COMPOSE_CMD% logs --tail=50 lanhu-mcp
     echo.
     echo 💡 常见问题排查:
     echo    1. Cookie 是否正确？
     echo    2. 端口 8000 是否被占用？
     echo    3. Docker Desktop 是否正在运行？
     echo    4. Docker 资源是否充足？
+    echo    5. 确认 Docker Compose 命令格式是否正确（docker compose / docker-compose）
     echo.
     echo 📚 详细文档: 请查看 DEPLOY.md
     pause
@@ -160,4 +175,3 @@ if not errorlevel 1 (
 )
 
 pause
-

@@ -15,7 +15,21 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-# 检查 Docker
+# 检测 docker compose 命令（兼容 compose v1/compose v2）
+detect_docker_compose() {
+    if command -v docker-compose &> /dev/null; then
+        COMPOSE_CMD="docker-compose"
+        echo -e "${YELLOW}ℹ️  检测到 docker-compose (Compose V1)，将使用该命令${NC}"
+    elif docker compose version &> /dev/null; then
+        COMPOSE_CMD="docker compose"
+        echo -e "${YELLOW}ℹ️  检测到 docker compose (Compose V2)，将使用该命令${NC}"
+    else
+        return 1
+    fi
+    return 0
+}
+
+# 检查 Docker 环境
 echo "📦 检查 Docker 环境..."
 if ! command -v docker &> /dev/null; then
     echo -e "${RED}❌ 未安装 Docker，请先安装 Docker${NC}"
@@ -23,9 +37,11 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-if ! command -v docker-compose &> /dev/null; then
-    echo -e "${RED}❌ 未安装 Docker Compose，请先安装${NC}"
-    echo "   官方文档: https://docs.docker.com/compose/install/"
+# 检查 Compose 命令
+if ! detect_docker_compose; then
+    echo -e "${RED}❌ 未安装 Docker Compose（V1/V2），请先安装${NC}"
+    echo "   Compose V2 安装文档: https://docs.docker.com/compose/install/linux/"
+    echo "   Compose V1 安装文档: https://docs.docker.com/compose/install/other/"
     exit 1
 fi
 
@@ -108,11 +124,11 @@ echo ""
 # 构建和启动
 echo "🏗️  构建 Docker 镜像..."
 echo -e "${YELLOW}⏳ 这可能需要几分钟时间，请耐心等待...${NC}"
-docker-compose build
+$COMPOSE_CMD build
 
 echo ""
 echo "🚀 启动服务..."
-docker-compose up -d
+$COMPOSE_CMD up -d
 
 echo ""
 echo "⏱️  等待服务启动（10秒）..."
@@ -121,11 +137,12 @@ sleep 10
 # 检查服务状态
 echo ""
 echo "🔍 检查服务状态..."
-if docker-compose ps | grep -q "Up"; then
+# 兼容两种 compose 命令的 ps 输出格式
+if $COMPOSE_CMD ps | grep -q "Up"; then
     echo -e "${GREEN}✅ 服务启动成功！${NC}"
     echo ""
     echo "📊 服务信息:"
-    docker-compose ps
+    $COMPOSE_CMD ps
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}🎉 部署完成！${NC}"
@@ -135,10 +152,10 @@ if docker-compose ps | grep -q "Up"; then
     echo "   http://localhost:8000/mcp?role=开发&name=你的名字"
     echo ""
     echo "🔧 常用命令:"
-    echo "   查看日志: docker-compose logs -f lanhu-mcp"
-    echo "   停止服务: docker-compose stop"
-    echo "   重启服务: docker-compose restart"
-    echo "   删除服务: docker-compose down"
+    echo "   查看日志: $COMPOSE_CMD logs -f lanhu-mcp"
+    echo "   停止服务: $COMPOSE_CMD stop"
+    echo "   重启服务: $COMPOSE_CMD restart"
+    echo "   删除服务: $COMPOSE_CMD down"
     echo ""
     echo "📚 配置 AI 客户端:"
     echo "   请参考 DEPLOY.md 文档中的「连接 AI 客户端」章节"
@@ -152,7 +169,7 @@ else
     echo -e "${RED}❌ 服务启动失败${NC}"
     echo ""
     echo "📋 查看错误日志:"
-    docker-compose logs --tail=50 lanhu-mcp
+    $COMPOSE_CMD logs --tail=50 lanhu-mcp
     echo ""
     echo "💡 常见问题排查:"
     echo "   1. Cookie 是否正确？"
@@ -162,4 +179,3 @@ else
     echo "📚 详细文档: 请查看 DEPLOY.md"
     exit 1
 fi
-
