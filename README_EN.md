@@ -196,11 +196,32 @@ docker-compose up -d
 Configure in MCP-compatible AI clients (e.g., Claude Code, Cursor, Windsurf):
 
 **Cursor Configuration Example:**
+
+**stdio (recommended for one local user; set Cookie in MCP env):**
 ```json
 {
   "mcpServers": {
     "lanhu": {
-      "url": "http://localhost:8000/mcp?role=Backend&name=John"
+      "command": "python",
+      "args": ["E:/AiProject/lanhu-mcp/lanhu_mcp_server.py"],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "LANHU_COOKIE": "your_lanhu_cookie_here"
+      }
+    }
+  }
+}
+```
+
+**HTTP (recommended for shared multi-user server; each user sends their own Cookie header):**
+```json
+{
+  "mcpServers": {
+    "lanhu": {
+      "url": "http://localhost:8000/mcp?role=Backend&name=John",
+      "headers": {
+        "X-Lanhu-Cookie": "your_lanhu_cookie_here"
+      }
     }
   }
 }
@@ -209,6 +230,7 @@ Configure in MCP-compatible AI clients (e.g., Claude Code, Cursor, Windsurf):
 > 📌 URL Parameters:
 > - `role`: User role (Backend/Frontend/Tester/Product, etc.)
 > - `name`: User name (for collaboration tracking and @mentions)
+> - Do not put cookies in URL query parameters. Use `env.LANHU_COOKIE` for stdio and `headers.X-Lanhu-Cookie` for HTTP.
 
 ## 🎯 Team Message Board: Breaking the Last Mile of AI Collaboration
 

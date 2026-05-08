@@ -64,6 +64,8 @@ cat > .env << EOF
 
 # 蓝湖 Cookie（必需）
 LANHU_COOKIE="$LANHU_COOKIE"
+DDS_COOKIE=""
+MCP_TRANSPORT="http"
 
 # ==============================================
 # 服务器配置（可选）

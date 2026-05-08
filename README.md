@@ -264,11 +264,32 @@ docker-compose down              # 停止
 在支持 MCP 的 AI 客户端（如 Claude Code、Cursor、Windsurf）中配置：
 
 **Cursor 配置示例：**
+
+**stdio（推荐单用户本地使用，Cookie 放在 AI 工具 MCP 配置 env 中）：**
 ```json
 {
   "mcpServers": {
     "lanhu": {
-      "url": "http://localhost:8000/mcp?role=Developer&name=YourName"
+      "command": "python",
+      "args": ["E:/AiProject/lanhu-mcp/lanhu_mcp_server.py"],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "LANHU_COOKIE": "your_lanhu_cookie_here"
+      }
+    }
+  }
+}
+```
+
+**HTTP（推荐共享服务多用户使用，每个用户在 headers 中传自己的 Cookie）：**
+```json
+{
+  "mcpServers": {
+    "lanhu": {
+      "url": "http://localhost:8000/mcp?role=Developer&name=YourName",
+      "headers": {
+        "X-Lanhu-Cookie": "your_lanhu_cookie_here"
+      }
     }
   }
 }
@@ -278,6 +299,7 @@ docker-compose down              # 停止
 > - `role`: 用户角色（Developer/Frontend/Backend/Tester/Product 等）
 > - `name`: 用户姓名（用于协作追踪和 @提醒）
 > - ⚠️ **注意**：部分 AI 开发工具不支持 URL 中使用中文参数值，建议使用英文
+> - 不要把 Cookie 放在 URL query 参数中；stdio 用 `env.LANHU_COOKIE`，HTTP 用 `headers.X-Lanhu-Cookie`
 
 ## 🎯 提升 UI 还原度
 

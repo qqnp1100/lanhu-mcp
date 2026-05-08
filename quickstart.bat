@@ -127,7 +127,10 @@ echo 在 Cursor 中连接，请添加以下配置到 MCP 配置文件：
 echo {
 echo   "mcpServers": {
 echo     "lanhu": {
-echo       "url": "http://localhost:8000/mcp?role=Developer&name=YourName"
+echo       "url": "http://localhost:8000/mcp?role=Developer&name=YourName",
+echo       "headers": {
+echo         "X-Lanhu-Cookie": "your_lanhu_cookie_here"
+echo       }
 echo     }
 echo   }
 echo }

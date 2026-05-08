@@ -17,9 +17,10 @@ services:
     environment:
       # 这些环境变量会覆盖 .env 文件中的配置
       # 如果不需要覆盖，可以删除这些行
-      - SERVER_HOST=127.0.0.1
+      - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
-      # LANHU_COOKIE 从 .env 文件读取
+      # LANHU_COOKIE 从 .env 文件读取（仅作为单用户/默认 fallback）
+      # HTTP 多用户共享服务建议每个 MCP 客户端通过 headers.X-Lanhu-Cookie 传自己的 Cookie
       # FEISHU_WEBHOOK_URL 从 .env 文件读取（可选）
 
 # ============================================
@@ -48,10 +49,14 @@ services:
 #    {
 #      "mcpServers": {
 #        "lanhu": {
-#          "url": "http://localhost:8000/mcp?role=Developer&name=YourName"
+#          "url": "http://localhost:8000/mcp?role=Developer&name=YourName",
+#          "headers": {
+#            "X-Lanhu-Cookie": "your_lanhu_cookie_here"
+#          }
 #        }
 #      }
 #    }
+#    不要把 Cookie 放在 URL query 参数中。
 #    注意：部分 AI 开发工具不支持 URL 中文参数
 #
 # 7. 数据持久化：
@@ -80,8 +85,3 @@ services:
 #     - 重启服务：docker-compose restart lanhu-mcp
 #
 
-#     net stop winnat
-#     docker start container_name
-#     net start winnat
-
-# $OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
