@@ -341,6 +341,20 @@ https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx
 
 分析结果包含设计图预览、详细参数（尺寸/间距/颜色/字体等）以及转换后的 HTML+CSS 代码，便于还原实现。
 
+### 本地 Sketch JSON 生成 HTML
+
+仓库内置了一个调试脚本，可将 `tests/` 下的蓝湖 Sketch JSON 转换为 HTML：
+
+```powershell
+docker run --rm -v ${PWD}:/app -w /app lanhu-mcp-lanhu-mcp:latest python tests/generate_sketch_html.py
+```
+
+也可以指定输入 JSON 和输出 HTML：
+
+```powershell
+python tests/generate_sketch_html.py path\to\input.json -o path\to\output.html
+```
+
 ### 切图下载
 
 ```

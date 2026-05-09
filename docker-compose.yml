@@ -12,6 +12,7 @@ services:
     ports:
       - "8000:8000"  # 将宿主机的 8000 端口映射到容器的 8000 端口
     volumes:
+      - ./lanhu_mcp_server.py:/app/lanhu_mcp_server.py
       - ./data:/app/data  # 挂载数据目录，持久化缓存和截图
       - ./logs:/app/logs  # 挂载日志目录
     environment:
