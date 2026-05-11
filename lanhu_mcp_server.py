@@ -202,6 +202,275 @@ button:active {
 }
 """
 
+VISIBLE_RASTER_SLICE_TYPES = {"PNG", "JPG", "WEBP"}
+VISIBLE_VECTOR_SLICE_TYPES = {"SVG", "PDF"}
+INVALID_SLICE_ATTRS = (
+    'data-invalid-slice="true" '
+    'data-slice-valid="false" '
+    'data-invalid-slice-tip="无效切图不能下载到本地"'
+)
+
+
+def _first_value(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _nested_get(obj: dict, *path: str):
+    cur = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _lanhu_layer_width(layer: dict):
+    return _first_value(
+        layer.get("width"),
+        _nested_get(layer, "frame", "width"),
+        _nested_get(layer, "realFrame", "width"),
+    )
+
+
+def _lanhu_layer_height(layer: dict):
+    return _first_value(
+        layer.get("height"),
+        _nested_get(layer, "frame", "height"),
+        _nested_get(layer, "realFrame", "height"),
+    )
+
+
+def _lanhu_web_id(layer: dict):
+    return _first_value(layer.get("web_id"), layer.get("id"), layer.get("objectID"))
+
+
+def _iter_lanhu_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_lanhu_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_lanhu_dicts(child)
+
+
+def _iter_lanhu_layer_tree(value):
+    if isinstance(value, dict):
+        yield value
+        for child_key in ("layers", "children"):
+            children = value.get(child_key)
+            if isinstance(children, list):
+                for child in children:
+                    yield from _iter_lanhu_layer_tree(child)
+
+
+def _lanhu_frontend_layer_list(data) -> list:
+    """Match the layer collection Lanhu uses before building sliceIndex."""
+    if not isinstance(data, dict):
+        return [item for item in _iter_lanhu_dicts(data)]
+
+    artboard = data.get("artboard")
+    if isinstance(artboard, dict) and isinstance(artboard.get("layers"), list):
+        return [
+            layer
+            for child in artboard["layers"]
+            for layer in _iter_lanhu_layer_tree(child)
+        ]
+
+    info = data.get("info")
+    if isinstance(info, list):
+        return [item for item in info if isinstance(item, dict)]
+
+    return [item for item in _iter_lanhu_dicts(data)]
+
+
+def _looks_like_artboard_background(layer: dict, root_ids: set) -> bool:
+    name = str(layer.get("name") or "").strip().lower()
+    if name not in {"背景", "鑳屾櫙", "background", "bg"}:
+        return False
+    return layer.get("parentID") in root_ids or layer.get("parentId") in root_ids
+
+
+def _build_lanhu_slice_item(
+    *,
+    index: int,
+    name,
+    url,
+    svg,
+    asset: dict,
+    layer: dict,
+    asset_key: str,
+) -> dict:
+    item = {
+        "index": index,
+        "name": name or "",
+        "url": url or "",
+        "svg": svg or "",
+        asset_key: asset,
+        "width": _lanhu_layer_width(layer) or 0,
+        "height": _lanhu_layer_height(layer) or 0,
+        "web_id": _lanhu_web_id(layer),
+        "_layer_ref": layer,
+        "_asset_key": asset_key,
+    }
+
+    org_url = asset.get("orgUrl")
+    if org_url:
+        item["orgUrl"] = org_url
+
+    if asset.get("isNew"):
+        if asset.get("svgUrl"):
+            item["svgUrl"] = asset.get("svgUrl")
+        if asset.get("imageUrl"):
+            item["imageUrl"] = asset.get("imageUrl")
+
+    item["isSelected"] = True
+    item["isNameEditing"] = False
+    item["hasSvg"] = bool(item.get("svg") or item.get("svgUrl"))
+    return item
+
+
+def _extract_lanhu_ps_asset(layer: dict, index: int):
+    images = layer.get("images")
+    if not layer.get("isAsset") or not isinstance(images, dict):
+        return None
+
+    url = images.get("png_xxxhd")
+    if not url:
+        return None
+
+    if isinstance(url, str) and url[-2:] == "/0":
+        return None
+
+    return _build_lanhu_slice_item(
+        index=index,
+        name=layer.get("name"),
+        url=url,
+        svg=images.get("svg"),
+        asset=images,
+        layer=layer,
+        asset_key="images",
+    )
+
+
+def _extract_lanhu_image_asset(layer: dict, index: int):
+    image = layer.get("image")
+    if not isinstance(image, dict):
+        return None
+
+    return _build_lanhu_slice_item(
+        index=index,
+        name=layer.get("name"),
+        url=image.get("bitmap"),
+        svg=image.get("svg") or "",
+        asset=image,
+        layer=layer,
+        asset_key="image",
+    )
+
+
+def _lanhu_slice_dedupe_key(item: dict):
+    return (item.get("web_id"), item.get("name"), item.get("url") or item.get("imageUrl"))
+
+
+def _extract_lanhu_slice_index(
+    data,
+    *,
+    include_artboard_background: bool = False,
+) -> list:
+    items = []
+    seen = set()
+    root_ids = set()
+    if isinstance(data, dict):
+        root_ids.update(
+            value
+            for value in (
+                data.get("ArtboardID"),
+                _nested_get(data, "artboard", "id"),
+                _nested_get(data, "artboard", "objectID"),
+            )
+            if value
+        )
+
+    for index, layer in enumerate(_lanhu_frontend_layer_list(data)):
+        if not include_artboard_background and _looks_like_artboard_background(layer, root_ids):
+            continue
+
+        item = _extract_lanhu_ps_asset(layer, index) or _extract_lanhu_image_asset(layer, index)
+        if not item:
+            continue
+
+        key = _lanhu_slice_dedupe_key(item)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        items.append(item)
+
+    return items
+
+
+def _lanhu_slice_list_src(item: dict, enterprise: bool = False) -> str:
+    if enterprise:
+        return (
+            item.get("format_url")
+            or item.get("format_base64")
+            or item.get("imageUrl")
+            or item.get("url")
+            or item.get("orgUrl")
+            or item.get("svg")
+            or ""
+        )
+    return (
+        item.get("format_url")
+        or item.get("imageUrl")
+        or item.get("url")
+        or item.get("orgUrl")
+        or item.get("format_base64")
+        or item.get("svg")
+        or ""
+    )
+
+
+def _lanhu_valid_slice_layer_ids(data) -> set:
+    return {id(item["_layer_ref"]) for item in _extract_lanhu_slice_index(data)}
+
+
+def _extract_layer_image_candidate(layer: dict) -> dict | None:
+    """Return the renderable image-like resource on a layer, valid or not."""
+    images = layer.get("images")
+    if isinstance(images, dict):
+        url = images.get("png_xxxhd") or images.get("svg")
+        if url:
+            return {"url": url, "source": "images"}
+
+    image = layer.get("image")
+    if isinstance(image, dict):
+        url = (
+            image.get("bitmap")
+            or image.get("imageUrl")
+            or image.get("url")
+            or image.get("svg")
+            or image.get("svgUrl")
+        )
+        if url:
+            return {"url": url, "source": "image"}
+
+    dds = layer.get("ddsImage")
+    if isinstance(dds, dict):
+        url = dds.get("imageUrl")
+        if url:
+            return {"url": url, "source": "ddsImage"}
+
+    return None
+
+
+def _invalid_slice_attrs_html() -> str:
+    return " " + INVALID_SLICE_ATTRS
+
 
 def _camel_to_kebab(s: str) -> str:
     """驼峰命名转换为CSS短横线命名"""
@@ -882,9 +1151,57 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         m = re.search(r'(\d+)', style_name)
         return int(m.group(1)) if m else None
 
+    def extract_text_info(layer):
+        if not isinstance(layer, dict):
+            return None
+        if layer.get('textInfo'):
+            ti = layer.get('textInfo') or {}
+            return {
+                'text': ti.get('text', ''),
+                'color': ti.get('color'),
+                'size': ti.get('size', 0),
+                'font': ti.get('fontPostScriptName') or ti.get('fontName', ''),
+                'font_style_name': ti.get('fontStyleName', ''),
+                'font_weight': None,
+                'bold': ti.get('bold'),
+                'italic': ti.get('italic'),
+                'justification': ti.get('justification', 'left'),
+                'line_height': ti.get('leading'),
+            }
+
+        font = layer.get('font')
+        if layer.get('type') != 'text' or not isinstance(font, dict):
+            return None
+
+        styles = font.get('styles') or []
+        first_style = styles[0] if styles and isinstance(styles[0], dict) else {}
+        align_value = font.get('textAlignment', font.get('align'))
+        if align_value == 2:
+            justification = 'center'
+        elif align_value == 1:
+            justification = 'right'
+        elif isinstance(align_value, str):
+            justification = align_value
+        else:
+            justification = 'left'
+
+        return {
+            'text': font.get('content') or first_style.get('content') or '',
+            'color': font.get('color') or first_style.get('color'),
+            'size': font.get('size') or first_style.get('size') or 0,
+            'font': font.get('font') or first_style.get('font') or '',
+            'font_style_name': '',
+            'font_weight': first_style.get('fontWeight'),
+            'bold': first_style.get('fontWeight', 0) >= 600,
+            'italic': False,
+            'justification': justification,
+            'line_height': font.get('line') or first_style.get('line'),
+        }
+
     layers = []
     board_w = 375
     board_h = 667
+    valid_slice_layer_ids = _lanhu_valid_slice_layer_ids(sketch_data)
 
     if 'board' in sketch_data:
         board = sketch_data['board']
@@ -916,11 +1233,49 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
 
         for l in reversed(raw_layers):
             _flatten(l)
+    else:
+        layers = [
+            layer
+            for layer in _lanhu_frontend_layer_list(sketch_data)
+            if layer.get('visible', layer.get('isVisible', True)) is not False
+        ]
+        if layers:
+            board_w = max((px((L.get('left') or 0) + (L.get('width') or 0)) for L in layers), default=board_w)
+            board_h = max((px((L.get('top') or 0) + (L.get('height') or 0)) for L in layers), default=board_h)
 
     css_rules = []
     html_parts = []
     image_url_mapping = {}
+    slice_url_to_local_path = {}
+    used_slice_filenames = set()
     layer_annotations = []
+
+    def local_path_for_slice(layer_name, remote_url):
+        if remote_url in slice_url_to_local_path:
+            return slice_url_to_local_path[remote_url]
+
+        path = urlparse(remote_url).path
+        ext = '.png'
+        if '.' in path.split('/')[-1]:
+            candidate_ext = '.' + path.split('/')[-1].rsplit('.', 1)[-1].lower()
+            if candidate_ext in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'):
+                ext = candidate_ext
+
+        base = str(layer_name or '').replace('/', '_').replace(' ', '_').strip()
+        if not base:
+            base = f"slice_{len(used_slice_filenames) + 1}"
+
+        filename = f"{base}{ext}"
+        suffix = 2
+        while filename in used_slice_filenames:
+            filename = f"{base}_{suffix}{ext}"
+            suffix += 1
+
+        used_slice_filenames.add(filename)
+        local_path = f"./assets/slices/{filename}"
+        slice_url_to_local_path[remote_url] = local_path
+        image_url_mapping[local_path] = remote_url
+        return local_path
 
     for idx, L in enumerate(layers):
         cls = f"el{idx + 1}"
@@ -972,18 +1327,27 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         text_content = ""
         is_slice = False
         slice_url = ""
+        is_invalid_slice = False
+        image_candidate = _extract_layer_image_candidate(L)
+        is_bitmap_layer = str(ltype).lower() in {'bitmap', 'bitmaplayer'}
 
-        images = L.get('images') or {}
-        if images.get('png_xxxhd') or images.get('svg'):
+        if image_candidate:
             is_slice = True
-            slice_url = images.get('png_xxxhd') or images.get('svg')
-            local_name = f"{name.replace('/', '_').replace(' ', '_')}.png"
-            local_path = f"./assets/slices/{local_name}"
-            image_url_mapping[local_path] = slice_url
+            slice_url = image_candidate['url']
+            is_invalid_slice = id(L) not in valid_slice_layer_ids
             annot['slice_url'] = slice_url
+            annot['slice_valid'] = not is_invalid_slice
+            annot['slice_source'] = image_candidate['source']
 
-        if ltype == 'textLayer' and L.get('textInfo'):
-            ti = L['textInfo']
+            if is_invalid_slice and is_bitmap_layer:
+                continue
+
+            if not is_invalid_slice:
+                local_path_for_slice(name, slice_url)
+
+        text_info = extract_text_info(L)
+        if text_info:
+            ti = text_info
             text_content = ti.get('text', '')
             annot['text'] = text_content
             props.append('z-index:10')
@@ -995,15 +1359,20 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
             if font_size:
                 props.append(f"font-size:{font_size}px")
                 annot['css']['font-size'] = f'{font_size}px'
-            font_name = ti.get('fontPostScriptName') or ti.get('fontName', '')
+            font_name = ti.get('font', '')
             if font_name:
                 props.append(
                     f'font-family:"{font_name}","PingFang SC",'
                     f'"Microsoft YaHei","Hiragino Sans GB",sans-serif'
                 )
                 annot['css']['font-family'] = font_name
-            font_style_name = ti.get('fontStyleName', '')
+            font_style_name = ti.get('font_style_name', '')
             fw = parse_font_weight(font_style_name)
+            if not fw:
+                try:
+                    fw = int(ti.get('font_weight')) if ti.get('font_weight') is not None else None
+                except (TypeError, ValueError):
+                    fw = None
             if fw:
                 props.append(f"font-weight:{fw}")
                 annot['css']['font-weight'] = str(fw)
@@ -1019,7 +1388,11 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
                 annot['css']['text-align'] = just
             lines = [ln for ln in text_content.split('\r') if ln]
             line_count = max(len(lines), 1)
-            if line_count > 1 and h > 0 and font_size > 0:
+            line_height = px(ti.get('line_height')) if ti.get('line_height') else None
+            if line_height:
+                props.append(f"line-height:{line_height}px")
+                annot['css']['line-height'] = f'{line_height}px'
+            elif line_count > 1 and h > 0 and font_size > 0:
                 lh = round(h / line_count * 10) / 10
                 props.append(f"line-height:{lh}px")
             else:
@@ -1049,7 +1422,8 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         elif is_slice:
             html_parts.append(
                 f'<img class="{cls}" title="{safe_name}" data-css="{safe_css}" '
-                f'src="{slice_url}" referrerpolicy="no-referrer" />'
+                f'src="{slice_url}" referrerpolicy="no-referrer"'
+                f'{_invalid_slice_attrs_html() if is_invalid_slice else ""} />'
             )
         else:
             html_parts.append(
@@ -1539,6 +1913,8 @@ def _localize_image_urls(html_code: str, design_name: str) -> tuple[str, dict]:
     # Step 2: 替换 <img src="...">，优先用 img 的 class 属性
     def _replace_img_tag(tag_match):
         tag = tag_match.group(0)
+        if 'data-invalid-slice="true"' in tag or 'data-slice-valid="false"' in tag:
+            return tag
         src_m = re.search(r'src=["\']?(https?://[^"\'>\s]+)["\']?', tag)
         if not src_m:
             return tag
@@ -2978,6 +3354,81 @@ class LanhuExtractor:
             meta.get('sliceScale') or
             2
         )
+
+        slices = []
+        for item in _extract_lanhu_slice_index(sketch_data):
+            layer = item.get('_layer_ref') or {}
+            image_data = item.get('image') or item.get('images') or {}
+            download_url = _lanhu_slice_list_src(item)
+            logical_w = item.get('width') or 0
+            logical_h = item.get('height') or 0
+            size_str = f"{int(logical_w)}x{int(logical_h)}" if logical_w and logical_h else "unknown"
+            is_svg = bool(item.get('svg') or item.get('svgUrl')) and not image_data.get('imageUrl')
+
+            slice_info = {
+                'id': _lanhu_web_id(layer),
+                'name': item.get('name') or '',
+                'type': layer.get('type') or layer.get('layerType') or layer.get('ddsType') or 'bitmap',
+                'download_url': download_url,
+                'size': size_str,
+                'format': 'svg' if is_svg else 'png',
+                'slice_valid': True,
+                'source': item.get('_asset_key'),
+                'layer_path': item.get('name') or '',
+            }
+
+            if item.get('svgUrl') and item.get('imageUrl'):
+                slice_info['svg_url'] = item['svgUrl']
+
+            if download_url and not is_svg and logical_w and logical_h:
+                slice_info['scale_urls'] = self._build_scale_urls(
+                    download_url, logical_w, logical_h, slice_scale
+                )
+                slice_info['logical_size'] = {
+                    'width': int(logical_w),
+                    'height': int(logical_h),
+                    'note': f'1x logical px; stored at {slice_scale}x = {int(logical_w * slice_scale)}x{int(logical_h * slice_scale)}px'
+                }
+
+            frame = layer.get('frame') or layer.get('bounds') or {}
+            x = frame.get('x', layer.get('left'))
+            y = frame.get('y', layer.get('top'))
+            if x is not None or y is not None:
+                slice_info['position'] = {'x': int(x or 0), 'y': int(y or 0)}
+
+            if include_metadata:
+                metadata = {}
+                for source_key, target_key in (
+                    ('fills', 'fills'),
+                    ('borders', 'borders'),
+                    ('strokes', 'borders'),
+                    ('opacity', 'opacity'),
+                    ('rotation', 'rotation'),
+                    ('textStyle', 'text_style'),
+                    ('shadows', 'shadows'),
+                    ('radius', 'border_radius'),
+                    ('cornerRadius', 'border_radius'),
+                ):
+                    value = layer.get(source_key)
+                    if value:
+                        metadata[target_key] = value
+                if metadata:
+                    slice_info['metadata'] = metadata
+
+            slices.append(slice_info)
+
+        return {
+            'design_id': image_id,
+            'design_name': result['name'],
+            'version': latest_version['version_info'],
+            'slice_scale': slice_scale,
+            'canvas_size': {
+                'width': result.get('width'),
+                'height': result.get('height')
+            },
+            'total_slices': len(slices),
+            'slices': slices
+        }
         # Figma 设计：bitmapLayer(hasExportImage=True) 才是真切图，shapeLayer 的 ddsImage 是图片填充层
         is_figma = (meta.get('host') or {}).get('name') == 'figma'
 
@@ -4984,6 +5435,8 @@ async def lanhu_get_ai_analyze_design_result(
                    Flutter     → AssetImage('assets/images/cover.png')
                    Plain HTML  → <img src="./assets/slices/cover.png">
               3. NEVER use remote lanhu CDN URLs in any generated code.
+              4. If an <img> has data-invalid-slice="true" or
+                 data-slice-valid="false", do not download that image.
             Additionally, call lanhu_get_design_slices(url, design_name) to get the
             full slice list for more fine-grained assets (icons, background images, etc.).
 
