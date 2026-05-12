@@ -21,6 +21,12 @@ class _FastMCPStub:
 
         return decorator
 
+    def custom_route(self, *args, **kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
     def run(self, *args, **kwargs):
         pass
 

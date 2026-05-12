@@ -50,13 +50,11 @@ mcp = FastMCP("Lanhu Axure Extractor")
 # 全局配置
 DEFAULT_COOKIE = "your_lanhu_cookie_here"  # 请替换为你的蓝湖Cookie，从浏览器开发者工具中获取
 
-# 从环境变量读取Cookie，如果没有则使用默认值
-COOKIE = os.getenv("LANHU_COOKIE", DEFAULT_COOKIE)
-
 BASE_URL = "https://lanhuapp.com"
 DDS_BASE_URL = "https://dds.lanhuapp.com"
 CDN_URL = "https://axure-file.lanhuapp.com"
-DDS_COOKIE = os.getenv("DDS_COOKIE", COOKIE)
+LANHU_COOKIE_HEADER_NAMES = ("X-Lanhu-Cookie", "Lanhu-Cookie", "LANHU_COOKIE")
+DDS_COOKIE_HEADER_NAMES = ("X-Lanhu-DDS-Cookie", "DDS_COOKIE")
 
 # 飞书机器人Webhook配置（支持环境变量）
 DEFAULT_FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-key-here"
@@ -2573,6 +2571,92 @@ def get_user_info(ctx: Context) -> tuple:
     return '匿名', '未知'
 
 
+class LanhuCookieNotConfigured(Exception):
+    """Raised when the current MCP request has no usable Lanhu cookie."""
+
+
+def _normalize_cookie_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value or None
+
+
+def _is_cookie_configured(value: Optional[str]) -> bool:
+    value = _normalize_cookie_value(value)
+    return bool(value and value != DEFAULT_COOKIE)
+
+
+def _get_http_header_value(header_names: Tuple[str, ...]) -> Optional[str]:
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        req = get_http_request()
+        headers = getattr(req, "headers", None)
+        if not headers:
+            return None
+        for name in header_names:
+            value = headers.get(name)
+            if _is_cookie_configured(value):
+                return _normalize_cookie_value(value)
+    except Exception:
+        pass
+    return None
+
+
+def get_current_lanhu_cookies() -> dict:
+    """
+    Resolve cookies for the current MCP call.
+
+    Priority:
+    1. HTTP request headers (for shared HTTP MCP servers)
+    2. Process environment variables (for stdio or single-user fallback)
+    """
+    lanhu_cookie = _get_http_header_value(LANHU_COOKIE_HEADER_NAMES)
+    if not _is_cookie_configured(lanhu_cookie):
+        lanhu_cookie = _normalize_cookie_value(os.getenv("LANHU_COOKIE"))
+
+    if not _is_cookie_configured(lanhu_cookie):
+        raise LanhuCookieNotConfigured(
+            "LANHU_COOKIE is not configured. Configure it in your MCP client env for stdio, "
+            "or send X-Lanhu-Cookie in headers for shared HTTP MCP."
+        )
+
+    dds_cookie = _get_http_header_value(DDS_COOKIE_HEADER_NAMES)
+    if not _is_cookie_configured(dds_cookie):
+        dds_cookie = _normalize_cookie_value(os.getenv("DDS_COOKIE"))
+    if not _is_cookie_configured(dds_cookie):
+        dds_cookie = lanhu_cookie
+
+    return {
+        "lanhu_cookie": lanhu_cookie,
+        "dds_cookie": dds_cookie,
+    }
+
+
+def lanhu_cookie_error_response(error: Exception = None) -> dict:
+    return {
+        "status": "error",
+        "error": "LANHU_COOKIE_NOT_CONFIGURED",
+        "message": str(error) if error else (
+            "LANHU_COOKIE is not configured. Configure it in your MCP client env for stdio, "
+            "or send X-Lanhu-Cookie in headers for shared HTTP MCP."
+        ),
+        "stdio_example": {
+            "env": {
+                "MCP_TRANSPORT": "stdio",
+                "LANHU_COOKIE": "your_lanhu_cookie_here",
+            }
+        },
+        "http_example": {
+            "headers": {
+                "X-Lanhu-Cookie": "your_lanhu_cookie_here",
+            }
+        },
+    }
+
+
 def _clean_message_dict(msg: dict, current_user_name: str = None) -> dict:
     """
     清理消息字典，移除null值的更新字段，并添加快捷标志
@@ -2604,12 +2688,11 @@ def get_project_id_from_url(url: str) -> str:
     """从URL中提取project_id"""
     if not url or url.lower() == 'all':
         return None
-    extractor = LanhuExtractor()
-    params = extractor.parse_url(url)
+    params = LanhuExtractor.parse_url(url)
     return params.get('project_id', '')
 
 
-async def _fetch_metadata_from_url(url: str) -> dict:
+async def _fetch_metadata_from_url(url: str, cookies: dict) -> dict:
     """
     从蓝湖URL获取标准元数据（10个字段）- 支持基于版本号的永久缓存
     
@@ -2631,7 +2714,7 @@ async def _fetch_metadata_from_url(url: str) -> dict:
         'doc_url': None
     }
     
-    extractor = LanhuExtractor()
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         params = extractor.parse_url(url)
         project_id = params.get('project_id')
@@ -2721,12 +2804,14 @@ class LanhuExtractor:
 
     CACHE_META_FILE = ".lanhu_cache.json"  # 缓存元数据文件名
 
-    def __init__(self):
+    def __init__(self, lanhu_cookie: str, dds_cookie: Optional[str] = None):
+        self.lanhu_cookie = lanhu_cookie
+        self.dds_cookie = dds_cookie or lanhu_cookie
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Referer": "https://lanhuapp.com/web/",
             "Accept": "application/json, text/plain, */*",
-            "Cookie": COOKIE,
+            "Cookie": self.lanhu_cookie,
             "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -2735,7 +2820,8 @@ class LanhuExtractor:
         }
         self.client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers, follow_redirects=True)
 
-    def parse_url(self, url: str) -> dict:
+    @staticmethod
+    def parse_url(url: str) -> dict:
         """
         解析蓝湖URL，支持多种格式：
         1. 完整URL: https://lanhuapp.com/web/#/item/project/product?tid=...&pid=...
@@ -3829,7 +3915,7 @@ class LanhuExtractor:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://dds.lanhuapp.com/",
-            "Cookie": DDS_COOKIE,
+            "Cookie": self.dds_cookie,
             "Authorization": "Basic dW5kZWZpbmVkOg==",
         }
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=dds_headers, follow_redirects=True) as dds_client:
@@ -4308,8 +4394,10 @@ async def lanhu_resolve_invite_link(
     """
     try:
         # 解析Cookie字符串为playwright格式
+        resolved_cookies = get_current_lanhu_cookies()
+        lanhu_cookie = resolved_cookies["lanhu_cookie"]
         cookies = []
-        for cookie_str in COOKIE.split('; '):
+        for cookie_str in lanhu_cookie.split('; '):
             if '=' in cookie_str:
                 name, value = cookie_str.split('=', 1)
                 cookies.append({
@@ -4342,9 +4430,8 @@ async def lanhu_resolve_invite_link(
             await browser.close()
             
             # 解析最终URL
-            extractor = LanhuExtractor()
             try:
-                params = extractor.parse_url(final_url)
+                params = LanhuExtractor.parse_url(final_url)
                 
                 return {
                     "status": "success",
@@ -4361,9 +4448,10 @@ async def lanhu_resolve_invite_link(
                     "parse_error": str(e),
                     "message": "URL resolved but parsing failed. You can try using the resolved_url directly."
                 }
-            finally:
-                await extractor.close()
-                
+    except LanhuCookieNotConfigured as e:
+        result = lanhu_cookie_error_response(e)
+        result["invite_url"] = invite_url
+        return result
     except Exception as e:
         return {
             "status": "error",
@@ -4462,7 +4550,12 @@ async def lanhu_get_pages(
     Returns:
         Page list and document metadata
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -5115,7 +5208,12 @@ async def lanhu_get_ai_analyze_page_result(
           When generating code, you MUST use these exact color/font/size values from
           [设计样式参考] instead of guessing. For images, use the local file paths provided.
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
 
     try:
         # 记录协作者
@@ -5429,7 +5527,12 @@ async def lanhu_get_designs(
     Returns:
         Design image list and project metadata
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -5585,7 +5688,12 @@ async def lanhu_get_ai_analyze_design_result(
         DESIGN IMAGE is for visual verification ONLY. It has the LOWEST priority.
         NEVER use the design image to override any CSS value from the HTML+CSS code.
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -6007,7 +6115,12 @@ async def lanhu_get_design_slices(
     Returns:
         Slice list with download URLs, AI will handle smart naming and batch download
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -6321,6 +6434,11 @@ async def lanhu_say(
         Post result, including message ID and details
     """
     # 获取用户信息
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6329,7 +6447,7 @@ async def lanhu_say(
         return {"status": "error", "message": "无法从URL解析project_id"}
     
     # 获取元数据（自动，带缓存）
-    metadata = await _fetch_metadata_from_url(url)
+    metadata = await _fetch_metadata_from_url(url, cookies)
     
     # 验证message_type
     valid_types = ['normal', 'task', 'question', 'urgent', 'knowledge']
@@ -6460,6 +6578,11 @@ async def lanhu_say_list(
         Message list, including mentions_me count
     """
     # 获取用户信息
+    try:
+        get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 验证filter_type
@@ -6710,6 +6833,11 @@ async def lanhu_say_detail(
         Message detail list with full content
     """
     # 获取用户信息
+    try:
+        get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 确定project_id
@@ -6777,6 +6905,11 @@ async def lanhu_say_edit(
         Updated message details
     """
     # 获取用户信息
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6823,7 +6956,7 @@ async def lanhu_say_edit(
     # 发送飞书编辑通知
     try:
         # 获取元数据
-        metadata = await _fetch_metadata_from_url(url)
+        metadata = await _fetch_metadata_from_url(url, cookies)
         
         await send_feishu_notification(
             summary=f"🔄 [已编辑] {updated_msg.get('summary', '')}",
@@ -6863,6 +6996,11 @@ async def lanhu_say_delete(
         Delete result
     """
     # 获取用户信息
+    try:
+        get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6910,6 +7048,11 @@ async def lanhu_get_members(
         Collaborator list with first and last access time
     """
     # 获取用户信息
+    try:
+        get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6939,7 +7082,11 @@ async def health_check(request):
 if __name__ == "__main__":
     # 运行MCP服务器
     # 使用HTTP传输方式，支持环境变量配置
-    SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-    SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
-    mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
+    MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http").lower()
+    if MCP_TRANSPORT == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+        SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+        mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
 
