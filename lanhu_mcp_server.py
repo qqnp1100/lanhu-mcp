@@ -11,7 +11,7 @@ import json
 import hashlib
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Annotated, Optional, Union, List, Any
+from typing import Annotated, Optional, Union, List, Any, Dict, Iterable, Set, Tuple
 
 # 加载 .env 文件中的环境变量（必须在其他导入之前）
 # 注意：在 Docker 容器中，环境变量通常已由 docker-compose 通过 env_file 设置
@@ -50,11 +50,13 @@ mcp = FastMCP("Lanhu Axure Extractor")
 # 全局配置
 DEFAULT_COOKIE = "your_lanhu_cookie_here"  # 请替换为你的蓝湖Cookie，从浏览器开发者工具中获取
 
+# 从环境变量读取Cookie，如果没有则使用默认值
+COOKIE = os.getenv("LANHU_COOKIE", DEFAULT_COOKIE)
+
 BASE_URL = "https://lanhuapp.com"
 DDS_BASE_URL = "https://dds.lanhuapp.com"
 CDN_URL = "https://axure-file.lanhuapp.com"
-LANHU_COOKIE_HEADER_NAMES = ("X-Lanhu-Cookie", "Lanhu-Cookie", "LANHU_COOKIE")
-DDS_COOKIE_HEADER_NAMES = ("X-Lanhu-DDS-Cookie", "DDS_COOKIE")
+DDS_COOKIE = os.getenv("DDS_COOKIE", COOKIE)
 
 # 飞书机器人Webhook配置（支持环境变量）
 DEFAULT_FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-key-here"
@@ -202,275 +204,6 @@ button:active {
 }
 """
 
-VISIBLE_RASTER_SLICE_TYPES = {"PNG", "JPG", "WEBP"}
-VISIBLE_VECTOR_SLICE_TYPES = {"SVG", "PDF"}
-INVALID_SLICE_ATTRS = (
-    'data-invalid-slice="true" '
-    'data-slice-valid="false" '
-    'data-invalid-slice-tip="无效切图不能下载到本地"'
-)
-
-
-def _first_value(*values):
-    for value in values:
-        if value is not None:
-            return value
-    return None
-
-
-def _nested_get(obj: dict, *path: str):
-    cur = obj
-    for key in path:
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(key)
-    return cur
-
-
-def _lanhu_layer_width(layer: dict):
-    return _first_value(
-        layer.get("width"),
-        _nested_get(layer, "frame", "width"),
-        _nested_get(layer, "realFrame", "width"),
-    )
-
-
-def _lanhu_layer_height(layer: dict):
-    return _first_value(
-        layer.get("height"),
-        _nested_get(layer, "frame", "height"),
-        _nested_get(layer, "realFrame", "height"),
-    )
-
-
-def _lanhu_web_id(layer: dict):
-    return _first_value(layer.get("web_id"), layer.get("id"), layer.get("objectID"))
-
-
-def _iter_lanhu_dicts(value):
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _iter_lanhu_dicts(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _iter_lanhu_dicts(child)
-
-
-def _iter_lanhu_layer_tree(value):
-    if isinstance(value, dict):
-        yield value
-        for child_key in ("layers", "children"):
-            children = value.get(child_key)
-            if isinstance(children, list):
-                for child in children:
-                    yield from _iter_lanhu_layer_tree(child)
-
-
-def _lanhu_frontend_layer_list(data) -> list:
-    """Match the layer collection Lanhu uses before building sliceIndex."""
-    if not isinstance(data, dict):
-        return [item for item in _iter_lanhu_dicts(data)]
-
-    artboard = data.get("artboard")
-    if isinstance(artboard, dict) and isinstance(artboard.get("layers"), list):
-        return [
-            layer
-            for child in artboard["layers"]
-            for layer in _iter_lanhu_layer_tree(child)
-        ]
-
-    info = data.get("info")
-    if isinstance(info, list):
-        return [item for item in info if isinstance(item, dict)]
-
-    return [item for item in _iter_lanhu_dicts(data)]
-
-
-def _looks_like_artboard_background(layer: dict, root_ids: set) -> bool:
-    name = str(layer.get("name") or "").strip().lower()
-    if name not in {"背景", "鑳屾櫙", "background", "bg"}:
-        return False
-    return layer.get("parentID") in root_ids or layer.get("parentId") in root_ids
-
-
-def _build_lanhu_slice_item(
-    *,
-    index: int,
-    name,
-    url,
-    svg,
-    asset: dict,
-    layer: dict,
-    asset_key: str,
-) -> dict:
-    item = {
-        "index": index,
-        "name": name or "",
-        "url": url or "",
-        "svg": svg or "",
-        asset_key: asset,
-        "width": _lanhu_layer_width(layer) or 0,
-        "height": _lanhu_layer_height(layer) or 0,
-        "web_id": _lanhu_web_id(layer),
-        "_layer_ref": layer,
-        "_asset_key": asset_key,
-    }
-
-    org_url = asset.get("orgUrl")
-    if org_url:
-        item["orgUrl"] = org_url
-
-    if asset.get("isNew"):
-        if asset.get("svgUrl"):
-            item["svgUrl"] = asset.get("svgUrl")
-        if asset.get("imageUrl"):
-            item["imageUrl"] = asset.get("imageUrl")
-
-    item["isSelected"] = True
-    item["isNameEditing"] = False
-    item["hasSvg"] = bool(item.get("svg") or item.get("svgUrl"))
-    return item
-
-
-def _extract_lanhu_ps_asset(layer: dict, index: int):
-    images = layer.get("images")
-    if not layer.get("isAsset") or not isinstance(images, dict):
-        return None
-
-    url = images.get("png_xxxhd")
-    if not url:
-        return None
-
-    if isinstance(url, str) and url[-2:] == "/0":
-        return None
-
-    return _build_lanhu_slice_item(
-        index=index,
-        name=layer.get("name"),
-        url=url,
-        svg=images.get("svg"),
-        asset=images,
-        layer=layer,
-        asset_key="images",
-    )
-
-
-def _extract_lanhu_image_asset(layer: dict, index: int):
-    image = layer.get("image")
-    if not isinstance(image, dict):
-        return None
-
-    return _build_lanhu_slice_item(
-        index=index,
-        name=layer.get("name"),
-        url=image.get("bitmap"),
-        svg=image.get("svg") or "",
-        asset=image,
-        layer=layer,
-        asset_key="image",
-    )
-
-
-def _lanhu_slice_dedupe_key(item: dict):
-    return (item.get("web_id"), item.get("name"), item.get("url") or item.get("imageUrl"))
-
-
-def _extract_lanhu_slice_index(
-    data,
-    *,
-    include_artboard_background: bool = False,
-) -> list:
-    items = []
-    seen = set()
-    root_ids = set()
-    if isinstance(data, dict):
-        root_ids.update(
-            value
-            for value in (
-                data.get("ArtboardID"),
-                _nested_get(data, "artboard", "id"),
-                _nested_get(data, "artboard", "objectID"),
-            )
-            if value
-        )
-
-    for index, layer in enumerate(_lanhu_frontend_layer_list(data)):
-        if not include_artboard_background and _looks_like_artboard_background(layer, root_ids):
-            continue
-
-        item = _extract_lanhu_ps_asset(layer, index) or _extract_lanhu_image_asset(layer, index)
-        if not item:
-            continue
-
-        key = _lanhu_slice_dedupe_key(item)
-        if key in seen:
-            continue
-
-        seen.add(key)
-        items.append(item)
-
-    return items
-
-
-def _lanhu_slice_list_src(item: dict, enterprise: bool = False) -> str:
-    if enterprise:
-        return (
-            item.get("format_url")
-            or item.get("format_base64")
-            or item.get("imageUrl")
-            or item.get("url")
-            or item.get("orgUrl")
-            or item.get("svg")
-            or ""
-        )
-    return (
-        item.get("format_url")
-        or item.get("imageUrl")
-        or item.get("url")
-        or item.get("orgUrl")
-        or item.get("format_base64")
-        or item.get("svg")
-        or ""
-    )
-
-
-def _lanhu_valid_slice_layer_ids(data) -> set:
-    return {id(item["_layer_ref"]) for item in _extract_lanhu_slice_index(data)}
-
-
-def _extract_layer_image_candidate(layer: dict) -> dict | None:
-    """Return the renderable image-like resource on a layer, valid or not."""
-    images = layer.get("images")
-    if isinstance(images, dict):
-        url = images.get("png_xxxhd") or images.get("svg")
-        if url:
-            return {"url": url, "source": "images"}
-
-    image = layer.get("image")
-    if isinstance(image, dict):
-        url = (
-            image.get("bitmap")
-            or image.get("imageUrl")
-            or image.get("url")
-            or image.get("svg")
-            or image.get("svgUrl")
-        )
-        if url:
-            return {"url": url, "source": "image"}
-
-    dds = layer.get("ddsImage")
-    if isinstance(dds, dict):
-        url = dds.get("imageUrl")
-        if url:
-            return {"url": url, "source": "ddsImage"}
-
-    return None
-
-
-def _invalid_slice_attrs_html() -> str:
-    return " " + INVALID_SLICE_ATTRS
-
 
 def _camel_to_kebab(s: str) -> str:
     """驼峰命名转换为CSS短横线命名"""
@@ -549,6 +282,280 @@ def _merge_margin(styles: dict) -> None:
         
         for k in ['marginTop', 'marginRight', 'marginBottom', 'marginLeft']:
             styles.pop(k, None)
+
+
+_LANHU_RASTER_FILE_TYPES = {"PNG", "JPG", "WEBP"}
+_LANHU_VECTOR_FILE_TYPES = {"SVG", "PDF"}
+
+
+def _lanhu_first_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _lanhu_nested_get(obj: Dict[str, Any], *path: str) -> Any:
+    cur: Any = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _lanhu_layer_width(layer: Dict[str, Any]) -> Any:
+    return _lanhu_first_value(
+        layer.get("width"),
+        _lanhu_nested_get(layer, "frame", "width"),
+        _lanhu_nested_get(layer, "realFrame", "width"),
+        _lanhu_nested_get(layer, "bounds", "width"),
+    )
+
+
+def _lanhu_layer_height(layer: Dict[str, Any]) -> Any:
+    return _lanhu_first_value(
+        layer.get("height"),
+        _lanhu_nested_get(layer, "frame", "height"),
+        _lanhu_nested_get(layer, "realFrame", "height"),
+        _lanhu_nested_get(layer, "bounds", "height"),
+    )
+
+
+def _lanhu_layer_left(layer: Dict[str, Any]) -> Any:
+    return _lanhu_first_value(
+        layer.get("left"),
+        layer.get("x"),
+        _lanhu_nested_get(layer, "frame", "x"),
+        _lanhu_nested_get(layer, "realFrame", "x"),
+        _lanhu_nested_get(layer, "bounds", "x"),
+        _lanhu_nested_get(layer, "bounds", "left"),
+    )
+
+
+def _lanhu_layer_top(layer: Dict[str, Any]) -> Any:
+    return _lanhu_first_value(
+        layer.get("top"),
+        layer.get("y"),
+        _lanhu_nested_get(layer, "frame", "y"),
+        _lanhu_nested_get(layer, "realFrame", "y"),
+        _lanhu_nested_get(layer, "bounds", "y"),
+        _lanhu_nested_get(layer, "bounds", "top"),
+    )
+
+
+def _lanhu_iter_dicts(value: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _lanhu_iter_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _lanhu_iter_dicts(child)
+
+
+def _lanhu_iter_layer_tree(value: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for child_key in ("layers", "children"):
+            children = value.get(child_key)
+            if isinstance(children, list):
+                for child in children:
+                    yield from _lanhu_iter_layer_tree(child)
+
+
+def _lanhu_frontend_layer_list(data: Any) -> List[Dict[str, Any]]:
+    """Return the layer list Lanhu feeds into the slice panel."""
+    if not isinstance(data, dict):
+        return [item for item in _lanhu_iter_dicts(data)]
+
+    artboard = data.get("artboard")
+    if isinstance(artboard, dict) and isinstance(artboard.get("layers"), list):
+        return [
+            layer
+            for child in artboard["layers"]
+            for layer in _lanhu_iter_layer_tree(child)
+            if isinstance(layer, dict)
+        ]
+
+    info = data.get("info")
+    if isinstance(info, list):
+        return [item for item in info if isinstance(item, dict)]
+
+    return [item for item in _lanhu_iter_dicts(data)]
+
+
+def _lanhu_root_ids(data: Any) -> Set[Any]:
+    if not isinstance(data, dict):
+        return set()
+    return {
+        value
+        for value in (
+            data.get("ArtboardID"),
+            _lanhu_nested_get(data, "artboard", "id"),
+            _lanhu_nested_get(data, "artboard", "objectID"),
+        )
+        if value
+    }
+
+
+def _lanhu_looks_like_artboard_background(layer: Dict[str, Any], root_ids: Set[Any]) -> bool:
+    name = str(layer.get("name") or "").strip().lower()
+    if name not in {"背景", "background", "bg"}:
+        return False
+    return layer.get("parentID") in root_ids or layer.get("parentId") in root_ids
+
+
+def _lanhu_build_slice_item(
+    *,
+    index: int,
+    web_id: Any,
+    name: Any,
+    url: Any,
+    svg: Any,
+    asset: Dict[str, Any],
+    layer: Dict[str, Any],
+    asset_key: str,
+) -> Dict[str, Any]:
+    item: Dict[str, Any] = {
+        "index": index,
+        "name": name or "",
+        "url": url or "",
+        "svg": svg or "",
+        asset_key: asset,
+        "width": _lanhu_layer_width(layer) or 0,
+        "height": _lanhu_layer_height(layer) or 0,
+        "web_id": web_id,
+        "isSelected": True,
+        "isNameEditing": False,
+    }
+
+    left = _lanhu_layer_left(layer)
+    top = _lanhu_layer_top(layer)
+    if left is not None:
+        item["left"] = left
+    if top is not None:
+        item["top"] = top
+
+    org_url = asset.get("orgUrl")
+    if org_url:
+        item["orgUrl"] = org_url
+
+    if asset.get("isNew"):
+        if asset.get("svgUrl"):
+            item["svgUrl"] = asset.get("svgUrl")
+        if asset.get("imageUrl"):
+            item["imageUrl"] = asset.get("imageUrl")
+
+    item["hasSvg"] = bool(item.get("svg") or item.get("svgUrl"))
+    return item
+
+
+def _lanhu_extract_ps_asset(layer: Dict[str, Any], index: int, web_id: Any) -> Optional[Dict[str, Any]]:
+    images = layer.get("images")
+    if not layer.get("isAsset") or not isinstance(images, dict):
+        return None
+
+    url = images.get("png_xxxhd")
+    if not url:
+        return None
+
+    # Lanhu frontend skips placeholder slice urls ending in "/0".
+    if isinstance(url, str) and url[-2:] == "/0":
+        return None
+
+    return _lanhu_build_slice_item(
+        index=index,
+        web_id=web_id,
+        name=layer.get("name"),
+        url=url,
+        svg=images.get("svg"),
+        asset=images,
+        layer=layer,
+        asset_key="images",
+    )
+
+
+def _lanhu_extract_image_asset(layer: Dict[str, Any], index: int, web_id: Any) -> Optional[Dict[str, Any]]:
+    image = layer.get("image")
+    if not isinstance(image, dict):
+        return None
+
+    return _lanhu_build_slice_item(
+        index=index,
+        web_id=web_id,
+        name=layer.get("name"),
+        url=image.get("bitmap"),
+        svg=image.get("svg") or "",
+        asset=image,
+        layer=layer,
+        asset_key="image",
+    )
+
+
+def _lanhu_slice_dedupe_key(item: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    return (item.get("web_id"), item.get("name"), item.get("url") or item.get("imageUrl"))
+
+
+def _extract_lanhu_slice_index(
+    data: Any,
+    *,
+    include_artboard_background: bool = False,
+    dedupe: bool = True,
+) -> List[Dict[str, Any]]:
+    """Mirror Lanhu's AllSliceList sliceIndex input as closely as possible."""
+    items: List[Dict[str, Any]] = []
+    seen: Set[Tuple[Any, Any, Any]] = set()
+    root_ids = _lanhu_root_ids(data)
+
+    for index, layer in enumerate(_lanhu_frontend_layer_list(data)):
+        if not include_artboard_background and _lanhu_looks_like_artboard_background(layer, root_ids):
+            continue
+
+        web_id = _lanhu_first_value(layer.get("web_id"), index + 1)
+        item = _lanhu_extract_ps_asset(layer, index, web_id) or _lanhu_extract_image_asset(layer, index, web_id)
+        if not item:
+            continue
+
+        key = _lanhu_slice_dedupe_key(item)
+        if dedupe and key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+
+    return items
+
+
+def _lanhu_visible_in_slice_list(item: Dict[str, Any], active_file_type: str = "PNG") -> bool:
+    active_file_type = (active_file_type or "PNG").strip().upper()
+    if active_file_type in _LANHU_RASTER_FILE_TYPES:
+        return True
+    if active_file_type in _LANHU_VECTOR_FILE_TYPES:
+        return bool(item.get("hasSvg"))
+    return False
+
+
+def _lanhu_slice_list_src(item: Dict[str, Any], enterprise: bool = False) -> str:
+    """Mirror AllSliceList.computed.sliceListSrc URL priority."""
+    if enterprise:
+        return (
+            item.get("format_url")
+            or item.get("format_base64")
+            or item.get("imageUrl")
+            or item.get("url")
+            or item.get("orgUrl")
+            or item.get("svg")
+            or ""
+        )
+    return (
+        item.get("format_url")
+        or item.get("imageUrl")
+        or item.get("url")
+        or item.get("orgUrl")
+        or item.get("format_base64")
+        or item.get("svg")
+        or ""
+    )
 
 
 def _should_use_flex(node: dict) -> bool:
@@ -1151,31 +1158,52 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         m = re.search(r'(\d+)', style_name)
         return int(m.group(1)) if m else None
 
-    def extract_text_info(layer):
-        if not isinstance(layer, dict):
-            return None
-        if layer.get('textInfo'):
-            ti = layer.get('textInfo') or {}
-            return {
-                'text': ti.get('text', ''),
-                'color': ti.get('color'),
-                'size': ti.get('size', 0),
-                'font': ti.get('fontPostScriptName') or ti.get('fontName', ''),
-                'font_style_name': ti.get('fontStyleName', ''),
-                'font_weight': None,
-                'bold': ti.get('bold'),
-                'italic': ti.get('italic'),
-                'justification': ti.get('justification', 'left'),
-                'line_height': ti.get('leading'),
-            }
+    def raw_layer_frame(layer):
+        frame = layer.get('layerOriginFrame') or layer.get('ddsOriginFrame') or {}
+        return {
+            'left': layer.get('left', frame.get('x', 0)) or 0,
+            'top': layer.get('top', frame.get('y', 0)) or 0,
+            'width': layer.get('width', frame.get('width', 0)) or 0,
+            'height': layer.get('height', frame.get('height', 0)) or 0,
+        }
 
-        font = layer.get('font')
-        if layer.get('type') != 'text' or not isinstance(font, dict):
-            return None
+    def raw_layer_image_url(layer):
+        images = layer.get('images')
+        if isinstance(images, dict):
+            url = images.get('png_xxxhd') or images.get('svg')
+            if url:
+                return url
 
+        image = layer.get('image')
+        if isinstance(image, dict):
+            url = (
+                image.get('bitmap')
+                or image.get('imageUrl')
+                or image.get('url')
+                or image.get('svg')
+                or image.get('svgUrl')
+            )
+            if url:
+                return url
+
+        dds_image = layer.get('ddsImage')
+        if isinstance(dds_image, dict):
+            url = dds_image.get('imageUrl') or dds_image.get('svgUrl')
+            if url:
+                return url
+
+        return ''
+
+    def raw_text_info(layer):
+        font = layer.get('font') or {}
         styles = font.get('styles') or []
         first_style = styles[0] if styles and isinstance(styles[0], dict) else {}
-        align_value = font.get('textAlignment', font.get('align'))
+        content = (
+            font.get('content')
+            or ''.join(str(style.get('content', '')) for style in styles if isinstance(style, dict))
+            or layer.get('name', '')
+        )
+        align_value = font.get('align', font.get('textAlignment'))
         if align_value == 2:
             justification = 'center'
         elif align_value == 1:
@@ -1186,22 +1214,116 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
             justification = 'left'
 
         return {
-            'text': font.get('content') or first_style.get('content') or '',
+            'text': content,
             'color': font.get('color') or first_style.get('color'),
-            'size': font.get('size') or first_style.get('size') or 0,
-            'font': font.get('font') or first_style.get('font') or '',
-            'font_style_name': '',
-            'font_weight': first_style.get('fontWeight'),
+            'size': font.get('size') or first_style.get('size') or layer.get('height'),
+            'fontPostScriptName': (
+                font.get('font')
+                or first_style.get('font')
+                or font.get('displayName')
+                or first_style.get('displayName')
+            ),
+            'fontStyleName': str(first_style.get('fontWeight') or ''),
             'bold': first_style.get('fontWeight', 0) >= 600,
             'italic': False,
             'justification': justification,
-            'line_height': font.get('line') or first_style.get('line'),
+        }
+
+    def raw_first_fill(layer):
+        for fill in layer.get('fills') or []:
+            if fill.get('isEnabled', True) and fill.get('color'):
+                return {'color': fill.get('color')}
+        return {}
+
+    def adapt_raw_layer(layer):
+        old_type = layer.get('type') or layer.get('ddsType') or ''
+        mapped_type = {
+            'text': 'textLayer',
+            'bitmap': 'bitmap',
+            'shape': 'shape',
+            'layer-group': 'layerSection',
+        }.get(old_type, old_type)
+        frame = raw_layer_frame(layer)
+        adapted = {
+            'name': layer.get('name', ''),
+            'type': mapped_type,
+            'left': frame['left'],
+            'top': frame['top'],
+            'width': frame['width'],
+            'height': frame['height'],
+            'visible': layer.get('isVisible', True),
+            'blendOptions': {'opacity': {'value': layer.get('opacity', 100)}},
+        }
+
+        if old_type == 'text':
+            adapted['textInfo'] = raw_text_info(layer)
+        else:
+            url = raw_layer_image_url(layer)
+            if url:
+                adapted['images'] = {'png_xxxhd': url}
+            fill = raw_first_fill(layer)
+            if fill:
+                adapted['fill'] = fill
+
+        return adapted
+
+    def build_board_from_info(data):
+        info = data.get('info') or []
+        children_by_parent = {}
+        for layer in info:
+            parent_id = layer.get('parentID')
+            if parent_id:
+                children_by_parent.setdefault(parent_id, []).append(layer)
+
+        artboard = next(
+            (
+                layer for layer in info
+                if layer.get('ddsType') == 'artboard-group' or layer.get('id') == data.get('ArtboardID')
+            ),
+            info[0] if info else {},
+        )
+
+        raw_layers = []
+        for layer in info:
+            old_type = layer.get('type') or layer.get('ddsType') or ''
+            if old_type == 'artboard-group' or layer.get('isVisible') is False:
+                continue
+            if old_type == 'layer-group' and children_by_parent.get(layer.get('id')) and not raw_layer_image_url(layer):
+                continue
+            if old_type in {'text', 'bitmap', 'shape', 'layer-group'}:
+                raw_layers.append(adapt_raw_layer(layer))
+
+        return {
+            'width': artboard.get('width', 750),
+            'height': artboard.get('height', 1334),
+            'layers': list(reversed(raw_layers)),
         }
 
     layers = []
     board_w = 375
     board_h = 667
-    valid_slice_layer_ids = _lanhu_valid_slice_layer_ids(sketch_data)
+
+    def _flatten(layer):
+        if not layer or not isinstance(layer, dict):
+            return
+        if layer.get('visible') is False:
+            return
+        w = layer.get('width', 0) or 0
+        h = layer.get('height', 0) or 0
+        if w == 0 and h == 0:
+            for child in reversed(layer.get('layers', [])):
+                _flatten(child)
+            return
+        ltype = layer.get('type', '')
+        if ltype == 'layerSection':
+            images = layer.get('images') or {}
+            if images.get('png_xxxhd') or images.get('svg'):
+                layers.append(layer)
+            else:
+                for child in reversed(layer.get('layers', [])):
+                    _flatten(child)
+            return
+        layers.append(layer)
 
     if 'board' in sketch_data:
         board = sketch_data['board']
@@ -1209,73 +1331,21 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         board_h = px(board.get('height', 1334))
         raw_layers = board.get('layers', [])
 
-        def _flatten(layer):
-            if not layer or not isinstance(layer, dict):
-                return
-            if layer.get('visible') is False:
-                return
-            w = layer.get('width', 0) or 0
-            h = layer.get('height', 0) or 0
-            if w == 0 and h == 0:
-                for child in reversed(layer.get('layers', [])):
-                    _flatten(child)
-                return
-            ltype = layer.get('type', '')
-            if ltype == 'layerSection':
-                images = layer.get('images') or {}
-                if images.get('png_xxxhd') or images.get('svg'):
-                    layers.append(layer)
-                else:
-                    for child in reversed(layer.get('layers', [])):
-                        _flatten(child)
-                return
-            layers.append(layer)
+        for l in reversed(raw_layers):
+            _flatten(l)
+    elif isinstance(sketch_data.get('info'), list):
+        board = build_board_from_info(sketch_data)
+        board_w = px(board.get('width', 750))
+        board_h = px(board.get('height', 1334))
+        raw_layers = board.get('layers', [])
 
         for l in reversed(raw_layers):
             _flatten(l)
-    else:
-        layers = [
-            layer
-            for layer in _lanhu_frontend_layer_list(sketch_data)
-            if layer.get('visible', layer.get('isVisible', True)) is not False
-        ]
-        if layers:
-            board_w = max((px((L.get('left') or 0) + (L.get('width') or 0)) for L in layers), default=board_w)
-            board_h = max((px((L.get('top') or 0) + (L.get('height') or 0)) for L in layers), default=board_h)
 
     css_rules = []
     html_parts = []
     image_url_mapping = {}
-    slice_url_to_local_path = {}
-    used_slice_filenames = set()
     layer_annotations = []
-
-    def local_path_for_slice(layer_name, remote_url):
-        if remote_url in slice_url_to_local_path:
-            return slice_url_to_local_path[remote_url]
-
-        path = urlparse(remote_url).path
-        ext = '.png'
-        if '.' in path.split('/')[-1]:
-            candidate_ext = '.' + path.split('/')[-1].rsplit('.', 1)[-1].lower()
-            if candidate_ext in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'):
-                ext = candidate_ext
-
-        base = str(layer_name or '').replace('/', '_').replace(' ', '_').strip()
-        if not base:
-            base = f"slice_{len(used_slice_filenames) + 1}"
-
-        filename = f"{base}{ext}"
-        suffix = 2
-        while filename in used_slice_filenames:
-            filename = f"{base}_{suffix}{ext}"
-            suffix += 1
-
-        used_slice_filenames.add(filename)
-        local_path = f"./assets/slices/{filename}"
-        slice_url_to_local_path[remote_url] = local_path
-        image_url_mapping[local_path] = remote_url
-        return local_path
 
     for idx, L in enumerate(layers):
         cls = f"el{idx + 1}"
@@ -1327,27 +1397,18 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         text_content = ""
         is_slice = False
         slice_url = ""
-        is_invalid_slice = False
-        image_candidate = _extract_layer_image_candidate(L)
-        is_bitmap_layer = str(ltype).lower() in {'bitmap', 'bitmaplayer'}
 
-        if image_candidate:
+        images = L.get('images') or {}
+        if images.get('png_xxxhd') or images.get('svg'):
             is_slice = True
-            slice_url = image_candidate['url']
-            is_invalid_slice = id(L) not in valid_slice_layer_ids
+            slice_url = images.get('png_xxxhd') or images.get('svg')
+            local_name = f"{name.replace('/', '_').replace(' ', '_')}.png"
+            local_path = f"./assets/slices/{local_name}"
+            image_url_mapping[local_path] = slice_url
             annot['slice_url'] = slice_url
-            annot['slice_valid'] = not is_invalid_slice
-            annot['slice_source'] = image_candidate['source']
 
-            if is_invalid_slice and is_bitmap_layer:
-                continue
-
-            if not is_invalid_slice:
-                local_path_for_slice(name, slice_url)
-
-        text_info = extract_text_info(L)
-        if text_info:
-            ti = text_info
+        if ltype == 'textLayer' and L.get('textInfo'):
+            ti = L['textInfo']
             text_content = ti.get('text', '')
             annot['text'] = text_content
             props.append('z-index:10')
@@ -1359,20 +1420,15 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
             if font_size:
                 props.append(f"font-size:{font_size}px")
                 annot['css']['font-size'] = f'{font_size}px'
-            font_name = ti.get('font', '')
+            font_name = ti.get('fontPostScriptName') or ti.get('fontName', '')
             if font_name:
                 props.append(
                     f'font-family:"{font_name}","PingFang SC",'
                     f'"Microsoft YaHei","Hiragino Sans GB",sans-serif'
                 )
                 annot['css']['font-family'] = font_name
-            font_style_name = ti.get('font_style_name', '')
+            font_style_name = ti.get('fontStyleName', '')
             fw = parse_font_weight(font_style_name)
-            if not fw:
-                try:
-                    fw = int(ti.get('font_weight')) if ti.get('font_weight') is not None else None
-                except (TypeError, ValueError):
-                    fw = None
             if fw:
                 props.append(f"font-weight:{fw}")
                 annot['css']['font-weight'] = str(fw)
@@ -1388,11 +1444,7 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
                 annot['css']['text-align'] = just
             lines = [ln for ln in text_content.split('\r') if ln]
             line_count = max(len(lines), 1)
-            line_height = px(ti.get('line_height')) if ti.get('line_height') else None
-            if line_height:
-                props.append(f"line-height:{line_height}px")
-                annot['css']['line-height'] = f'{line_height}px'
-            elif line_count > 1 and h > 0 and font_size > 0:
+            if line_count > 1 and h > 0 and font_size > 0:
                 lh = round(h / line_count * 10) / 10
                 props.append(f"line-height:{lh}px")
             else:
@@ -1422,8 +1474,7 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         elif is_slice:
             html_parts.append(
                 f'<img class="{cls}" title="{safe_name}" data-css="{safe_css}" '
-                f'src="{slice_url}" referrerpolicy="no-referrer"'
-                f'{_invalid_slice_attrs_html() if is_invalid_slice else ""} />'
+                f'src="{slice_url}" referrerpolicy="no-referrer" />'
             )
         else:
             html_parts.append(
@@ -1913,8 +1964,6 @@ def _localize_image_urls(html_code: str, design_name: str) -> tuple[str, dict]:
     # Step 2: 替换 <img src="...">，优先用 img 的 class 属性
     def _replace_img_tag(tag_match):
         tag = tag_match.group(0)
-        if 'data-invalid-slice="true"' in tag or 'data-slice-valid="false"' in tag:
-            return tag
         src_m = re.search(r'src=["\']?(https?://[^"\'>\s]+)["\']?', tag)
         if not src_m:
             return tag
@@ -2524,92 +2573,6 @@ def get_user_info(ctx: Context) -> tuple:
     return '匿名', '未知'
 
 
-class LanhuCookieNotConfigured(Exception):
-    """Raised when the current MCP request has no usable Lanhu cookie."""
-
-
-def _normalize_cookie_value(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        value = value[1:-1].strip()
-    return value or None
-
-
-def _is_cookie_configured(value: Optional[str]) -> bool:
-    value = _normalize_cookie_value(value)
-    return bool(value and value != DEFAULT_COOKIE)
-
-
-def _get_http_header_value(header_names: tuple[str, ...]) -> Optional[str]:
-    try:
-        from fastmcp.server.dependencies import get_http_request
-        req = get_http_request()
-        headers = getattr(req, "headers", None)
-        if not headers:
-            return None
-        for name in header_names:
-            value = headers.get(name)
-            if _is_cookie_configured(value):
-                return _normalize_cookie_value(value)
-    except Exception:
-        pass
-    return None
-
-
-def get_current_lanhu_cookies() -> dict:
-    """
-    Resolve cookies for the current MCP call.
-
-    Priority:
-    1. HTTP request headers (for shared HTTP MCP servers)
-    2. Process environment variables (for stdio or single-user fallback)
-    """
-    lanhu_cookie = _get_http_header_value(LANHU_COOKIE_HEADER_NAMES)
-    if not _is_cookie_configured(lanhu_cookie):
-        lanhu_cookie = _normalize_cookie_value(os.getenv("LANHU_COOKIE"))
-
-    if not _is_cookie_configured(lanhu_cookie):
-        raise LanhuCookieNotConfigured(
-            "LANHU_COOKIE is not configured. Configure it in your MCP client env for stdio, "
-            "or send X-Lanhu-Cookie in headers for shared HTTP MCP."
-        )
-
-    dds_cookie = _get_http_header_value(DDS_COOKIE_HEADER_NAMES)
-    if not _is_cookie_configured(dds_cookie):
-        dds_cookie = _normalize_cookie_value(os.getenv("DDS_COOKIE"))
-    if not _is_cookie_configured(dds_cookie):
-        dds_cookie = lanhu_cookie
-
-    return {
-        "lanhu_cookie": lanhu_cookie,
-        "dds_cookie": dds_cookie,
-    }
-
-
-def lanhu_cookie_error_response(error: Exception = None) -> dict:
-    return {
-        "status": "error",
-        "error": "LANHU_COOKIE_NOT_CONFIGURED",
-        "message": str(error) if error else (
-            "LANHU_COOKIE is not configured. Configure it in your MCP client env for stdio, "
-            "or send X-Lanhu-Cookie in headers for shared HTTP MCP."
-        ),
-        "stdio_example": {
-            "env": {
-                "MCP_TRANSPORT": "stdio",
-                "LANHU_COOKIE": "your_lanhu_cookie_here",
-            }
-        },
-        "http_example": {
-            "headers": {
-                "X-Lanhu-Cookie": "your_lanhu_cookie_here",
-            }
-        },
-    }
-
-
 def _clean_message_dict(msg: dict, current_user_name: str = None) -> dict:
     """
     清理消息字典，移除null值的更新字段，并添加快捷标志
@@ -2641,11 +2604,12 @@ def get_project_id_from_url(url: str) -> str:
     """从URL中提取project_id"""
     if not url or url.lower() == 'all':
         return None
-    params = LanhuExtractor.parse_url(url)
+    extractor = LanhuExtractor()
+    params = extractor.parse_url(url)
     return params.get('project_id', '')
 
 
-async def _fetch_metadata_from_url(url: str, cookies: dict) -> dict:
+async def _fetch_metadata_from_url(url: str) -> dict:
     """
     从蓝湖URL获取标准元数据（10个字段）- 支持基于版本号的永久缓存
     
@@ -2667,7 +2631,7 @@ async def _fetch_metadata_from_url(url: str, cookies: dict) -> dict:
         'doc_url': None
     }
     
-    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
+    extractor = LanhuExtractor()
     try:
         params = extractor.parse_url(url)
         project_id = params.get('project_id')
@@ -2757,14 +2721,12 @@ class LanhuExtractor:
 
     CACHE_META_FILE = ".lanhu_cache.json"  # 缓存元数据文件名
 
-    def __init__(self, lanhu_cookie: str, dds_cookie: Optional[str] = None):
-        self.lanhu_cookie = lanhu_cookie
-        self.dds_cookie = dds_cookie or lanhu_cookie
+    def __init__(self):
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Referer": "https://lanhuapp.com/web/",
             "Accept": "application/json, text/plain, */*",
-            "Cookie": self.lanhu_cookie,
+            "Cookie": COOKIE,
             "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -2773,8 +2735,7 @@ class LanhuExtractor:
         }
         self.client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers, follow_redirects=True)
 
-    @staticmethod
-    def parse_url(url: str) -> dict:
+    def parse_url(self, url: str) -> dict:
         """
         解析蓝湖URL，支持多种格式：
         1. 完整URL: https://lanhuapp.com/web/#/item/project/product?tid=...&pid=...
@@ -3309,6 +3270,50 @@ class LanhuExtractor:
             'android_xxxhdpi': make_url(stored_w, stored_h),               # = 原图
         }
 
+    @staticmethod
+    def _build_ps_scale_urls(image_url: str, base_w: float, base_h: float) -> dict:
+        """
+        生成 Photoshop 稿切图的多倍图下载 URL。
+
+        PS 稿里 layer.width/height 对应蓝湖切图面板的 @2x 像素尺寸，
+        也就是 iOS @2x / Android xhdpi。以 40x40 为例：
+        1x/mdpi = 20x20, 2x/xhdpi = 40x40, 3x/xxhdpi = 60x60。
+        """
+        if not image_url or not base_w or not base_h:
+            return {}
+
+        bw = max(1, int(round(base_w)))
+        bh = max(1, int(round(base_h)))
+
+        def js_round(v: float) -> int:
+            """模拟 JavaScript Math.round（.5 向上取整）"""
+            import math
+            return math.floor(v + 0.5)
+
+        def make_url(w: int, h: int) -> str:
+            w, h = max(1, w), max(1, h)
+            return f"{image_url}?x-oss-process=image/resize,w_{w},h_{h}/format,png"
+
+        one_x_w = bw / 2
+        one_x_h = bh / 2
+
+        return {
+            # Web / 通用
+            '1x': make_url(js_round(one_x_w), js_round(one_x_h)),
+            '2x': make_url(bw, bh),
+            '3x': make_url(js_round(one_x_w * 3), js_round(one_x_h * 3)),
+            # iOS
+            'ios_1x': make_url(js_round(one_x_w), js_round(one_x_h)),
+            'ios_2x': make_url(bw, bh),
+            'ios_3x': make_url(js_round(one_x_w * 3), js_round(one_x_h * 3)),
+            # Android
+            'android_mdpi': make_url(js_round(one_x_w), js_round(one_x_h)),
+            'android_hdpi': make_url(js_round(one_x_w * 1.5), js_round(one_x_h * 1.5)),
+            'android_xhdpi': make_url(bw, bh),
+            'android_xxhdpi': make_url(js_round(one_x_w * 3), js_round(one_x_h * 3)),
+            'android_xxxhdpi': make_url(js_round(one_x_w * 4), js_round(one_x_h * 4)),
+        }
+
     async def get_design_slices_info(self, image_id: str, team_id: str, project_id: str,
                                      include_metadata: bool = True) -> dict:
         """
@@ -3354,83 +3359,104 @@ class LanhuExtractor:
             meta.get('sliceScale') or
             2
         )
-
-        slices = []
-        for item in _extract_lanhu_slice_index(sketch_data):
-            layer = item.get('_layer_ref') or {}
-            image_data = item.get('image') or item.get('images') or {}
-            download_url = _lanhu_slice_list_src(item)
-            logical_w = item.get('width') or 0
-            logical_h = item.get('height') or 0
-            size_str = f"{int(logical_w)}x{int(logical_h)}" if logical_w and logical_h else "unknown"
-            is_svg = bool(item.get('svg') or item.get('svgUrl')) and not image_data.get('imageUrl')
-
-            slice_info = {
-                'id': _lanhu_web_id(layer),
-                'name': item.get('name') or '',
-                'type': layer.get('type') or layer.get('layerType') or layer.get('ddsType') or 'bitmap',
-                'download_url': download_url,
-                'size': size_str,
-                'format': 'svg' if is_svg else 'png',
-                'slice_valid': True,
-                'source': item.get('_asset_key'),
-                'layer_path': item.get('name') or '',
-            }
-
-            if item.get('svgUrl') and item.get('imageUrl'):
-                slice_info['svg_url'] = item['svgUrl']
-
-            if download_url and not is_svg and logical_w and logical_h:
-                slice_info['scale_urls'] = self._build_scale_urls(
-                    download_url, logical_w, logical_h, slice_scale
-                )
-                slice_info['logical_size'] = {
-                    'width': int(logical_w),
-                    'height': int(logical_h),
-                    'note': f'1x logical px; stored at {slice_scale}x = {int(logical_w * slice_scale)}x{int(logical_h * slice_scale)}px'
-                }
-
-            frame = layer.get('frame') or layer.get('bounds') or {}
-            x = frame.get('x', layer.get('left'))
-            y = frame.get('y', layer.get('top'))
-            if x is not None or y is not None:
-                slice_info['position'] = {'x': int(x or 0), 'y': int(y or 0)}
-
-            if include_metadata:
-                metadata = {}
-                for source_key, target_key in (
-                    ('fills', 'fills'),
-                    ('borders', 'borders'),
-                    ('strokes', 'borders'),
-                    ('opacity', 'opacity'),
-                    ('rotation', 'rotation'),
-                    ('textStyle', 'text_style'),
-                    ('shadows', 'shadows'),
-                    ('radius', 'border_radius'),
-                    ('cornerRadius', 'border_radius'),
-                ):
-                    value = layer.get(source_key)
-                    if value:
-                        metadata[target_key] = value
-                if metadata:
-                    slice_info['metadata'] = metadata
-
-            slices.append(slice_info)
-
-        return {
-            'design_id': image_id,
-            'design_name': result['name'],
-            'version': latest_version['version_info'],
-            'slice_scale': slice_scale,
-            'canvas_size': {
-                'width': result.get('width'),
-                'height': result.get('height')
-            },
-            'total_slices': len(slices),
-            'slices': slices
-        }
         # Figma 设计：bitmapLayer(hasExportImage=True) 才是真切图，shapeLayer 的 ddsImage 是图片填充层
         is_figma = (meta.get('host') or {}).get('name') == 'figma'
+
+        panel_slice_index = _extract_lanhu_slice_index(sketch_data)
+        if panel_slice_index:
+            slices = []
+            for item in panel_slice_index:
+                image_data = item.get('image') if isinstance(item.get('image'), dict) else {}
+                images_data = item.get('images') if isinstance(item.get('images'), dict) else {}
+                download_url = _lanhu_slice_list_src(item)
+                svg_url = item.get('svgUrl') or item.get('svg')
+
+                logical_w = item.get('width') or 0
+                logical_h = item.get('height') or 0
+                img_size = image_data.get('size') or {}
+                if img_size.get('width') and img_size.get('height'):
+                    logical_w = img_size.get('width')
+                    logical_h = img_size.get('height')
+
+                width = int(round(float(item.get('width') or 0)))
+                height = int(round(float(item.get('height') or 0)))
+                slice_info = {
+                    'id': item.get('web_id'),
+                    'name': item.get('name') or '',
+                    'type': 'ps-slice' if images_data else 'slice',
+                    'download_url': download_url,
+                    'size': f"{width}x{height}",
+                    'format': 'svg' if download_url == svg_url and not (item.get('imageUrl') or item.get('url')) else 'png',
+                    'has_svg': bool(item.get('hasSvg')),
+                    'slice_list_src': download_url,
+                    'visible_in_slice_list': {
+                        'PNG': _lanhu_visible_in_slice_list(item, 'PNG'),
+                        'JPG': _lanhu_visible_in_slice_list(item, 'JPG'),
+                        'WebP': _lanhu_visible_in_slice_list(item, 'WebP'),
+                        'SVG': _lanhu_visible_in_slice_list(item, 'SVG'),
+                        'PDF': _lanhu_visible_in_slice_list(item, 'PDF'),
+                    },
+                }
+
+                if svg_url:
+                    slice_info['svg_url'] = svg_url
+
+                if item.get('left') is not None or item.get('top') is not None:
+                    slice_info['position'] = {
+                        'x': int(round(float(item.get('left') or 0))),
+                        'y': int(round(float(item.get('top') or 0))),
+                    }
+
+                if images_data and images_data.get('png_xxxhd'):
+                    scale_urls = self._build_ps_scale_urls(
+                        images_data.get('png_xxxhd'),
+                        item.get('width') or logical_w,
+                        item.get('height') or logical_h,
+                    )
+                    if scale_urls:
+                        slice_info['scale_urls'] = scale_urls
+                    slice_info['base_size'] = {
+                        'width': int(round(float(item.get('width') or logical_w or 0))),
+                        'height': int(round(float(item.get('height') or logical_h or 0))),
+                        'note': 'PS slice base px; equals iOS @2x / Android xhdpi',
+                    }
+                    slice_info['logical_size'] = {
+                        'width': int(round(float((item.get('width') or logical_w or 0) / 2))),
+                        'height': int(round(float((item.get('height') or logical_h or 0) / 2))),
+                        'note': '1x logical px; PS slice base px equals iOS @2x / Android xhdpi',
+                    }
+                elif download_url and logical_w and logical_h and slice_info['format'] == 'png':
+                    scale_urls = self._build_scale_urls(download_url, logical_w, logical_h, slice_scale)
+                    if scale_urls:
+                        slice_info['scale_urls'] = scale_urls
+                    slice_info['logical_size'] = {
+                        'width': int(round(float(logical_w))),
+                        'height': int(round(float(logical_h))),
+                        'note': f'1x logical px; stored at {slice_scale}x = {int(round(float(logical_w) * slice_scale))}x{int(round(float(logical_h) * slice_scale))}px'
+                    }
+
+                if include_metadata:
+                    slice_info['metadata'] = {
+                        'source': 'lanhu_slice_list',
+                        'slice_index': item.get('index'),
+                        'web_id': item.get('web_id'),
+                        'hasSvg': bool(item.get('hasSvg')),
+                    }
+
+                slices.append(slice_info)
+
+            return {
+                'design_id': image_id,
+                'design_name': result['name'],
+                'version': latest_version['version_info'],
+                'slice_scale': slice_scale,
+                'canvas_size': {
+                    'width': result.get('width'),
+                    'height': result.get('height')
+                },
+                'total_slices': len(slices),
+                'slices': slices
+            }
 
         # 3. 递归提取所有切图
         slices = []
@@ -3666,6 +3692,101 @@ class LanhuExtractor:
             for item in sketch_data['info']:
                 find_slices(item)
 
+        # Photoshop：蓝湖在根节点 type=ps，切图登记在 assets[]（isSlice），
+        # 实际 PNG/SVG 地址在对应 id 的图层 images.png_xxxhd / images.svg（与 convert_sketch_to_html 一致）
+        if str(sketch_data.get('type') or '').lower() == 'ps':
+            by_id: dict = {}
+
+            def _index_ps(obj):
+                if not isinstance(obj, dict):
+                    return
+                oid = obj.get('id')
+                if oid is not None:
+                    by_id[oid] = obj
+                for k in ('layers', 'children'):
+                    for c in (obj.get(k) or []):
+                        if isinstance(c, dict):
+                            _index_ps(c)
+
+            board = sketch_data.get('board')
+            if isinstance(board, dict):
+                _index_ps(board)
+            for sec in sketch_data.get('info') or []:
+                if isinstance(sec, dict):
+                    _index_ps(sec)
+
+            existing_ids = {s.get('id') for s in slices}
+
+            for asset in sketch_data.get('assets') or []:
+                if not isinstance(asset, dict) or not asset.get('isSlice'):
+                    continue
+                lid = asset.get('id')
+                if lid is None or lid in existing_ids:
+                    continue
+                layer = by_id.get(lid)
+                if not isinstance(layer, dict):
+                    continue
+                imgs = layer.get('images') or {}
+                download_url = imgs.get('png_xxxhd') or imgs.get('svg')
+                if not download_url:
+                    continue
+
+                lw_raw = float(layer.get('width') or 0)
+                lh_raw = float(layer.get('height') or 0)
+                if lw_raw <= 0 or lh_raw <= 0:
+                    bb = asset.get('bounds') or {}
+                    lw_raw = float(bb.get('right', 0)) - float(bb.get('left', 0))
+                    lh_raw = float(bb.get('bottom', 0)) - float(bb.get('top', 0))
+                base_w = max(1.0, lw_raw)
+                base_h = max(1.0, lh_raw)
+                logical_w = max(1.0, base_w / 2)
+                logical_h = max(1.0, base_h / 2)
+
+                disp_name = asset.get('name') or layer.get('name') or 'slice'
+                size_str = f"{int(round(base_w))}x{int(round(base_h))}"
+                slice_info = {
+                    'id': lid,
+                    'name': disp_name,
+                    'type': layer.get('type') or 'ps-slice',
+                    'download_url': download_url,
+                    'size': size_str,
+                    'format': 'png' if imgs.get('png_xxxhd') else 'svg',
+                }
+                if imgs.get('png_xxxhd') and imgs.get('svg'):
+                    slice_info['svg_url'] = imgs['svg']
+
+                if 'left' in layer and 'top' in layer:
+                    slice_info['position'] = {
+                        'x': int(round(float(layer.get('left', 0)))),
+                        'y': int(round(float(layer.get('top', 0)))),
+                    }
+
+                slice_info['layer_path'] = disp_name
+
+                if include_metadata:
+                    md = {'source': 'photoshop', 'asset_id': lid}
+                    if asset.get('scaleType') is not None:
+                        md['scaleType'] = asset.get('scaleType')
+                    slice_info['metadata'] = md
+
+                if imgs.get('png_xxxhd'):
+                    scale_urls = self._build_ps_scale_urls(download_url, base_w, base_h)
+                    if scale_urls:
+                        slice_info['scale_urls'] = scale_urls
+                    slice_info['logical_size'] = {
+                        'width': int(round(logical_w)),
+                        'height': int(round(logical_h)),
+                        'note': '1x logical px; PS slice base px equals iOS @2x / Android xhdpi',
+                    }
+                    slice_info['base_size'] = {
+                        'width': int(round(base_w)),
+                        'height': int(round(base_h)),
+                        'note': 'PS slice base px; equals iOS @2x / Android xhdpi',
+                    }
+
+                slices.append(slice_info)
+                existing_ids.add(lid)
+
         return {
             'design_id': image_id,
             'design_name': result['name'],
@@ -3708,7 +3829,7 @@ class LanhuExtractor:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://dds.lanhuapp.com/",
-            "Cookie": self.dds_cookie,
+            "Cookie": DDS_COOKIE,
             "Authorization": "Basic dW5kZWZpbmVkOg==",
         }
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=dds_headers, follow_redirects=True) as dds_client:
@@ -4186,11 +4307,9 @@ async def lanhu_resolve_invite_link(
         Resolved URL and parsed parameters
     """
     try:
-        resolved_cookies = get_current_lanhu_cookies()
-        lanhu_cookie = resolved_cookies["lanhu_cookie"]
         # 解析Cookie字符串为playwright格式
         cookies = []
-        for cookie_str in lanhu_cookie.split('; '):
+        for cookie_str in COOKIE.split('; '):
             if '=' in cookie_str:
                 name, value = cookie_str.split('=', 1)
                 cookies.append({
@@ -4222,8 +4341,10 @@ async def lanhu_resolve_invite_link(
             
             await browser.close()
             
+            # 解析最终URL
+            extractor = LanhuExtractor()
             try:
-                params = LanhuExtractor.parse_url(final_url)
+                params = extractor.parse_url(final_url)
                 
                 return {
                     "status": "success",
@@ -4240,10 +4361,9 @@ async def lanhu_resolve_invite_link(
                     "parse_error": str(e),
                     "message": "URL resolved but parsing failed. You can try using the resolved_url directly."
                 }
-    except LanhuCookieNotConfigured as e:
-        result = lanhu_cookie_error_response(e)
-        result["invite_url"] = invite_url
-        return result
+            finally:
+                await extractor.close()
+                
     except Exception as e:
         return {
             "status": "error",
@@ -4342,12 +4462,7 @@ async def lanhu_get_pages(
     Returns:
         Page list and document metadata
     """
-    try:
-        cookies = get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
-    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
+    extractor = LanhuExtractor()
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -5000,12 +5115,7 @@ async def lanhu_get_ai_analyze_page_result(
           When generating code, you MUST use these exact color/font/size values from
           [设计样式参考] instead of guessing. For images, use the local file paths provided.
     """
-    try:
-        cookies = get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
-    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
+    extractor = LanhuExtractor()
 
     try:
         # 记录协作者
@@ -5319,12 +5429,7 @@ async def lanhu_get_designs(
     Returns:
         Design image list and project metadata
     """
-    try:
-        cookies = get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
-    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
+    extractor = LanhuExtractor()
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -5435,8 +5540,6 @@ async def lanhu_get_ai_analyze_design_result(
                    Flutter     → AssetImage('assets/images/cover.png')
                    Plain HTML  → <img src="./assets/slices/cover.png">
               3. NEVER use remote lanhu CDN URLs in any generated code.
-              4. If an <img> has data-invalid-slice="true" or
-                 data-slice-valid="false", do not download that image.
             Additionally, call lanhu_get_design_slices(url, design_name) to get the
             full slice list for more fine-grained assets (icons, background images, etc.).
 
@@ -5482,12 +5585,7 @@ async def lanhu_get_ai_analyze_design_result(
         DESIGN IMAGE is for visual verification ONLY. It has the LOWEST priority.
         NEVER use the design image to override any CSS value from the HTML+CSS code.
     """
-    try:
-        cookies = get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
-    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
+    extractor = LanhuExtractor()
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -5909,12 +6007,7 @@ async def lanhu_get_design_slices(
     Returns:
         Slice list with download URLs, AI will handle smart naming and batch download
     """
-    try:
-        cookies = get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
-    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
+    extractor = LanhuExtractor()
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -6228,11 +6321,6 @@ async def lanhu_say(
         Post result, including message ID and details
     """
     # 获取用户信息
-    try:
-        cookies = get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6241,7 +6329,7 @@ async def lanhu_say(
         return {"status": "error", "message": "无法从URL解析project_id"}
     
     # 获取元数据（自动，带缓存）
-    metadata = await _fetch_metadata_from_url(url, cookies)
+    metadata = await _fetch_metadata_from_url(url)
     
     # 验证message_type
     valid_types = ['normal', 'task', 'question', 'urgent', 'knowledge']
@@ -6372,11 +6460,6 @@ async def lanhu_say_list(
         Message list, including mentions_me count
     """
     # 获取用户信息
-    try:
-        get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 验证filter_type
@@ -6627,11 +6710,6 @@ async def lanhu_say_detail(
         Message detail list with full content
     """
     # 获取用户信息
-    try:
-        get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 确定project_id
@@ -6699,11 +6777,6 @@ async def lanhu_say_edit(
         Updated message details
     """
     # 获取用户信息
-    try:
-        cookies = get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6750,7 +6823,7 @@ async def lanhu_say_edit(
     # 发送飞书编辑通知
     try:
         # 获取元数据
-        metadata = await _fetch_metadata_from_url(url, cookies)
+        metadata = await _fetch_metadata_from_url(url)
         
         await send_feishu_notification(
             summary=f"🔄 [已编辑] {updated_msg.get('summary', '')}",
@@ -6790,11 +6863,6 @@ async def lanhu_say_delete(
         Delete result
     """
     # 获取用户信息
-    try:
-        get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6842,11 +6910,6 @@ async def lanhu_get_members(
         Collaborator list with first and last access time
     """
     # 获取用户信息
-    try:
-        get_current_lanhu_cookies()
-    except LanhuCookieNotConfigured as e:
-        return lanhu_cookie_error_response(e)
-
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6867,14 +6930,16 @@ async def lanhu_get_members(
     }
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok"})
+
+
 if __name__ == "__main__":
     # 运行MCP服务器
-    MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http").lower()
-    if MCP_TRANSPORT == "stdio":
-        mcp.run(transport="stdio")
-    else:
-        SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-        SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
-        mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
-
+    # 使用HTTP传输方式，支持环境变量配置
+    SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+    SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+    mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
 
