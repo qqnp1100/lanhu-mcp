@@ -9,6 +9,7 @@ import re
 import base64
 import json
 import hashlib
+import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Annotated, Optional, Union, List, Any, Dict, Iterable, Set, Tuple
@@ -63,6 +64,9 @@ FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", DEFAULT_FEISHU_WEBHOOK)
 # 数据存储目录
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+_file_locks_guard = threading.Lock()
+_file_locks: Dict[str, threading.RLock] = {}
 
 # HTTP 请求超时时间（秒）
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
@@ -2020,11 +2024,54 @@ def normalize_role(role: str) -> str:
     return role
 
 
-def _get_metadata_cache_key(project_id: str, doc_id: str = None) -> str:
+def _safe_cache_segment(value: Any, fallback: str = "unknown") -> str:
+    value = str(value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
+    return value[:120] or fallback
+
+
+def _get_file_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _file_locks_guard:
+        lock = _file_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _file_locks[key] = lock
+        return lock
+
+
+def _get_cookie_cache_scope(cookies: Optional[dict]) -> str:
+    if not cookies:
+        return "default"
+    raw_scope = "|".join(
+        _normalize_cookie_value(cookies.get(name)) or ""
+        for name in ("lanhu_cookie", "dds_cookie")
+    )
+    return hashlib.sha256(raw_scope.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_axure_cache_dirs(doc_id: str, cookies: Optional[dict]) -> Tuple[str, str]:
+    scope = _get_cookie_cache_scope(cookies)
+    doc_segment = _safe_cache_segment(doc_id)
+    base_dir = DATA_DIR / "axure_extract" / scope / doc_segment
+    screenshot_dir = DATA_DIR / "axure_extract_screenshots" / scope / doc_segment
+    return str(base_dir), str(screenshot_dir)
+
+
+def _get_design_cache_dir(project_id: str, cookies: Optional[dict]) -> Path:
+    scope = _get_cookie_cache_scope(cookies)
+    return DATA_DIR / "lanhu_designs" / scope / _safe_cache_segment(project_id)
+
+
+def _get_metadata_cache_key(project_id: str, doc_id: str = None, cache_scope: str = None) -> str:
     """生成元数据缓存键（不含版本号，用于查找）"""
+    parts = []
+    if cache_scope:
+        parts.append(_safe_cache_segment(cache_scope))
+    parts.append(_safe_cache_segment(project_id))
     if doc_id:
-        return f"{project_id}_{doc_id}"
-    return project_id
+        parts.append(_safe_cache_segment(doc_id))
+    return "_".join(parts)
 
 
 def _get_cached_metadata(cache_key: str, version_id: str = None) -> Optional[dict]:
@@ -2249,31 +2296,63 @@ class MessageStore:
         
         if project_id:
             self.file_path = self.storage_dir / f"{project_id}.json"
+            self._lock = _get_file_lock(self.file_path)
             self._data = self._load()
         else:
             # 全局模式，不加载单个文件
             self.file_path = None
+            self._lock = None
             self._data = None
     
-    def _load(self) -> dict:
-        """加载项目数据"""
-        if self.file_path.exists():
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
+    def _empty_data(self) -> dict:
         return {
             "project_id": self.project_id,
             "next_id": 1,
             "messages": [],
             "collaborators": []
         }
+
+    def _load_unlocked(self) -> dict:
+        if self.file_path and self.file_path.exists():
+            try:
+                with open(self.file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return self._empty_data()
+
+    def _save_unlocked(self):
+        if not self.file_path:
+            return
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.file_path.with_name(
+            f".{self.file_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.file_path)
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
+    def _load(self) -> dict:
+        """加载项目数据"""
+        if self._lock:
+            with self._lock:
+                return self._load_unlocked()
+        return self._load_unlocked()
     
     def _save(self):
         """保存项目数据"""
-        with open(self.file_path, 'w', encoding='utf-8') as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
+        if self._lock:
+            with self._lock:
+                self._save_unlocked()
+        else:
+            self._save_unlocked()
     
     def _get_now(self) -> str:
         """获取当前时间字符串（东八区/北京时间）"""
@@ -2300,6 +2379,13 @@ class MessageStore:
         return False
     
     def record_collaborator(self, name: str, role: str):
+        if not self._lock:
+            return
+        with self._lock:
+            self._data = self._load_unlocked()
+            return self._record_collaborator_unlocked(name, role)
+
+    def _record_collaborator_unlocked(self, name: str, role: str):
         """记录/更新协作者"""
         if not name or not role:
             return
@@ -2311,7 +2397,7 @@ class MessageStore:
         for collab in collaborators:
             if collab["name"] == name and collab["role"] == role:
                 collab["last_seen"] = now
-                self._save()
+                self._save_unlocked()
                 return
         
         # 新增协作者
@@ -2322,13 +2408,34 @@ class MessageStore:
             "last_seen": now
         })
         self._data["collaborators"] = collaborators
-        self._save()
+        self._save_unlocked()
     
     def get_collaborators(self) -> List[dict]:
         """获取协作者列表"""
+        if self._lock:
+            with self._lock:
+                self._data = self._load_unlocked()
         return self._data.get("collaborators", [])
+
+    def update_project_metadata(self, project_name: str = None, folder_name: str = None):
+        with self._lock:
+            self._data = self._load_unlocked()
+            changed = False
+            if project_name and not self._data.get("project_name"):
+                self._data["project_name"] = project_name
+                changed = True
+            if folder_name and not self._data.get("folder_name"):
+                self._data["folder_name"] = folder_name
+                changed = True
+            if changed:
+                self._save_unlocked()
     
-    def save_message(self, summary: str, content: str, author_name: str, 
+    def save_message(self, *args, **kwargs) -> dict:
+        with self._lock:
+            self._data = self._load_unlocked()
+            return self._save_message_unlocked(*args, **kwargs)
+
+    def _save_message_unlocked(self, summary: str, content: str, author_name: str, 
                      author_role: str, mentions: List[str] = None,
                      message_type: str = 'normal',
                      project_name: str = None, folder_name: str = None,
@@ -2384,11 +2491,14 @@ class MessageStore:
         }
         
         self._data["messages"].append(message)
-        self._save()
+        self._save_unlocked()
         return message
     
     def get_messages(self, user_role: str = None) -> List[dict]:
         """获取所有消息（不含content，用于列表展示）"""
+        if self._lock:
+            with self._lock:
+                self._data = self._load_unlocked()
         messages = []
         for msg in self._data.get("messages", []):
             msg_copy = {k: v for k, v in msg.items() if k != "content"}
@@ -2400,6 +2510,9 @@ class MessageStore:
         return messages
     
     def get_message_by_id(self, msg_id: int, user_role: str = None) -> Optional[dict]:
+        if self._lock:
+            with self._lock:
+                self._data = self._load_unlocked()
         """根据ID获取消息（含content）"""
         for msg in self._data.get("messages", []):
             if msg["id"] == msg_id:
@@ -2409,7 +2522,12 @@ class MessageStore:
                 return msg_copy
         return None
     
-    def update_message(self, msg_id: int, editor_name: str, editor_role: str,
+    def update_message(self, *args, **kwargs) -> Optional[dict]:
+        with self._lock:
+            self._data = self._load_unlocked()
+            return self._update_message_unlocked(*args, **kwargs)
+
+    def _update_message_unlocked(self, msg_id: int, editor_name: str, editor_role: str,
                        summary: str = None, content: str = None, 
                        mentions: List[str] = None) -> Optional[dict]:
         """更新消息"""
@@ -2424,17 +2542,22 @@ class MessageStore:
                 msg["updated_at"] = self._get_now()
                 msg["updated_by_name"] = editor_name
                 msg["updated_by_role"] = editor_role
-                self._save()
+                self._save_unlocked()
                 return msg
         return None
     
     def delete_message(self, msg_id: int) -> bool:
+        with self._lock:
+            self._data = self._load_unlocked()
+            return self._delete_message_unlocked(msg_id)
+
+    def _delete_message_unlocked(self, msg_id: int) -> bool:
         """删除消息"""
         messages = self._data.get("messages", [])
         for i, msg in enumerate(messages):
             if msg["id"] == msg_id:
                 messages.pop(i)
-                self._save()
+                self._save_unlocked()
                 return True
         return False
     
@@ -2715,6 +2838,7 @@ async def _fetch_metadata_from_url(url: str, cookies: dict) -> dict:
     }
     
     extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
+    cache_scope = _get_cookie_cache_scope(cookies)
     try:
         params = extractor.parse_url(url)
         project_id = params.get('project_id')
@@ -2728,7 +2852,7 @@ async def _fetch_metadata_from_url(url: str, cookies: dict) -> dict:
             return metadata
         
         # 生成缓存键
-        cache_key = _get_metadata_cache_key(project_id, doc_id)
+        cache_key = _get_metadata_cache_key(project_id, doc_id, cache_scope=cache_scope)
         
         # 如果有doc_id，获取文档信息和版本号
         version_id = None
@@ -5228,8 +5352,7 @@ async def lanhu_get_ai_analyze_page_result(
         doc_id = params['doc_id']
 
         # 设置输出目录（内部实现，自动管理）
-        resource_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}")
-        output_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}_screenshots")
+        resource_dir, output_dir = _get_axure_cache_dirs(doc_id, cookies)
 
         # 下载资源（支持智能缓存）
         download_result = await extractor.download_resources(url, resource_dir)
@@ -5758,7 +5881,7 @@ async def lanhu_get_ai_analyze_design_result(
                 f"⚠️ No matching design found\n\nAvailable designs:\n" + "\n".join(f"  • {name}" for name in available_names)]
 
         # 设置输出目录（内部实现，自动管理）
-        output_dir = DATA_DIR / 'lanhu_designs' / params['project_id']
+        output_dir = _get_design_cache_dir(params['project_id'], cookies)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # 下载设计图并生成HTML
@@ -6477,11 +6600,10 @@ async def lanhu_say(
     store.record_collaborator(user_name, user_role)
     
     # 保存项目元数据到store（如果首次获取到）
-    if metadata.get('project_name') and not store._data.get('project_name'):
-        store._data['project_name'] = metadata['project_name']
-    if metadata.get('folder_name') and not store._data.get('folder_name'):
-        store._data['folder_name'] = metadata['folder_name']
-    store._save()
+    store.update_project_metadata(
+        project_name=metadata.get('project_name'),
+        folder_name=metadata.get('folder_name'),
+    )
     
     message = store.save_message(
         summary=summary,

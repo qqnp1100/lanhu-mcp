@@ -149,3 +149,63 @@ def test_placeholder_cookie_raises_configuration_error(server, monkeypatch):
 
     with pytest.raises(server.LanhuCookieNotConfigured):
         server.get_current_lanhu_cookies()
+
+
+def test_metadata_cache_key_can_be_scoped_per_cookie(server):
+    user_a_key = server._get_metadata_cache_key("project-1", "doc-1", cache_scope="user-a")
+    user_b_key = server._get_metadata_cache_key("project-1", "doc-1", cache_scope="user-b")
+
+    assert user_a_key != user_b_key
+    assert user_a_key.endswith("project-1_doc-1")
+
+
+def test_axure_cache_dirs_are_scoped_per_cookie(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+
+    user_a_dirs = server._get_axure_cache_dirs(
+        "doc-abcdef123456",
+        {"lanhu_cookie": "lanhu-cookie-a", "dds_cookie": "dds-cookie-a"},
+    )
+    user_b_dirs = server._get_axure_cache_dirs(
+        "doc-abcdef123456",
+        {"lanhu_cookie": "lanhu-cookie-b", "dds_cookie": "dds-cookie-b"},
+    )
+
+    assert user_a_dirs != user_b_dirs
+    assert user_a_dirs[0].startswith(str(tmp_path))
+    assert "doc-abcdef123456" in user_a_dirs[0]
+
+
+def test_design_cache_dir_is_scoped_per_cookie(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+
+    user_a_dir = server._get_design_cache_dir(
+        "project-1",
+        {"lanhu_cookie": "lanhu-cookie-a", "dds_cookie": "dds-cookie-a"},
+    )
+    user_b_dir = server._get_design_cache_dir(
+        "project-1",
+        {"lanhu_cookie": "lanhu-cookie-b", "dds_cookie": "dds-cookie-b"},
+    )
+
+    assert user_a_dir != user_b_dir
+    assert user_a_dir.parent.name != user_b_dir.parent.name
+    assert user_a_dir.name == "project-1"
+
+
+def test_message_store_does_not_overwrite_interleaved_writes(server, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+
+    store_a = server.MessageStore("project-1")
+    store_b = server.MessageStore("project-1")
+
+    msg_a = store_a.save_message("a", "content-a", "alice", "dev")
+    msg_b = store_b.save_message("b", "content-b", "bob", "qa")
+
+    saved = (tmp_path / "messages" / "project-1.json").read_text(encoding="utf-8")
+    data = __import__("json").loads(saved)
+
+    assert msg_a["id"] == 1
+    assert msg_b["id"] == 2
+    assert [msg["summary"] for msg in data["messages"]] == ["a", "b"]
+    assert data["next_id"] == 3
