@@ -220,7 +220,8 @@ def dedupe_key(item: Dict[str, Any]) -> Tuple[Any, Any, Any]:
 def extract_slice_index(
     data: Any,
     *,
-    include_artboard_background: bool = False,
+    include_artboard_background: bool = True,
+    dedupe: bool = False,
 ) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     seen: Set[Tuple[Any, Any, Any]] = set()
@@ -245,10 +246,10 @@ def extract_slice_index(
             continue
 
         key = dedupe_key(item)
-        if key in seen:
-            continue
-
-        seen.add(key)
+        if dedupe:
+            if key in seen:
+                continue
+            seen.add(key)
         items.append(item)
 
     return items

@@ -371,6 +371,19 @@ def _lanhu_frontend_layer_list(data: Any) -> List[Dict[str, Any]]:
     if not isinstance(data, dict):
         return [item for item in _lanhu_iter_dicts(data)]
 
+    # Lanhu's detail page builds LayerBox.sliceIndex from the normalized
+    # layer array used by the active design type: g.info for PS/plugin JSON and
+    # g.array for older Sketch JSON. Some JSON payloads also contain an
+    # artboard tree, but the web slice panel does not use that tree when the
+    # normalized list is present.
+    info = data.get("info")
+    if isinstance(info, list):
+        return [item for item in info if isinstance(item, dict)]
+
+    array = data.get("array")
+    if isinstance(array, list):
+        return [item for item in array if isinstance(item, dict)]
+
     artboard = data.get("artboard")
     if isinstance(artboard, dict) and isinstance(artboard.get("layers"), list):
         return [
@@ -379,10 +392,6 @@ def _lanhu_frontend_layer_list(data: Any) -> List[Dict[str, Any]]:
             for layer in _lanhu_iter_layer_tree(child)
             if isinstance(layer, dict)
         ]
-
-    info = data.get("info")
-    if isinstance(info, list):
-        return [item for item in info if isinstance(item, dict)]
 
     return [item for item in _lanhu_iter_dicts(data)]
 
@@ -502,8 +511,8 @@ def _lanhu_slice_dedupe_key(item: Dict[str, Any]) -> Tuple[Any, Any, Any]:
 def _extract_lanhu_slice_index(
     data: Any,
     *,
-    include_artboard_background: bool = False,
-    dedupe: bool = True,
+    include_artboard_background: bool = True,
+    dedupe: bool = False,
 ) -> List[Dict[str, Any]]:
     """Mirror Lanhu's AllSliceList sliceIndex input as closely as possible."""
     items: List[Dict[str, Any]] = []
