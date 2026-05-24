@@ -2820,7 +2820,7 @@ def get_project_id_from_url(url: str) -> str:
     """从URL中提取project_id"""
     if not url or url.lower() == 'all':
         return None
-    params = LanhuExtractor.parse_url(url)
+    params = LanhuExtractor.parse_url(url, require_team_id=False)
     return params.get('project_id', '')
 
 
@@ -2849,7 +2849,7 @@ async def _fetch_metadata_from_url(url: str, cookies: dict) -> dict:
     extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     cache_scope = _get_cookie_cache_scope(cookies)
     try:
-        params = extractor.parse_url(url)
+        params = await extractor.resolve_url_params(url)
         project_id = params.get('project_id')
         doc_id = params.get('doc_id')
         team_id = params.get('team_id')
@@ -2940,6 +2940,7 @@ class LanhuExtractor:
     def __init__(self, lanhu_cookie: str, dds_cookie: Optional[str] = None):
         self.lanhu_cookie = lanhu_cookie
         self.dds_cookie = dds_cookie or lanhu_cookie
+        self._current_team_id = None
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Referer": "https://lanhuapp.com/web/",
@@ -2954,7 +2955,7 @@ class LanhuExtractor:
         self.client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers, follow_redirects=True)
 
     @staticmethod
-    def parse_url(url: str) -> dict:
+    def parse_url(url: str, require_team_id: bool = True) -> dict:
         """
         解析蓝湖URL，支持多种格式：
         1. 完整URL: https://lanhuapp.com/web/#/item/project/product?tid=...&pid=...
@@ -3004,7 +3005,7 @@ class LanhuExtractor:
         if not project_id:
             raise ValueError(f"URL parsing failed: missing required param pid (project_id)")
 
-        if not team_id:
+        if require_team_id and not team_id:
             raise ValueError(f"URL parsing failed: missing required param tid/teamId (team_id)")
 
         return {
@@ -3013,6 +3014,39 @@ class LanhuExtractor:
             'doc_id': doc_id,
             'version_id': version_id
         }
+
+    @staticmethod
+    def _extract_team_id_from_user_settings(data: dict) -> Optional[str]:
+        result = data.get("result", {})
+        if isinstance(result, str):
+            result = json.loads(result)
+        return result.get("teamStatus", {}).get("team_id")
+
+    async def _fetch_current_team_id(self) -> str:
+        if self._current_team_id:
+            return self._current_team_id
+
+        response = await self.client.get(
+            f"{BASE_URL}/api/account/user_settings",
+            params={"settings_type": "web_main"},
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        if data.get("code") != "00000":
+            raise ValueError(f"Failed to fetch current team_id: {data.get('msg', 'Unknown error')}")
+
+        team_id = self._extract_team_id_from_user_settings(data)
+        if not team_id:
+            raise ValueError("Failed to fetch current team_id: missing result.teamStatus.team_id")
+        self._current_team_id = team_id
+        return team_id
+
+    async def resolve_url_params(self, url: str) -> dict:
+        params = self.parse_url(url, require_team_id=False)
+        if not params.get("team_id"):
+            params["team_id"] = await self._fetch_current_team_id()
+        return params
 
     async def get_document_info(self, project_id: str, doc_id: str) -> dict:
         """获取文档信息"""
@@ -3124,7 +3158,7 @@ class LanhuExtractor:
 
     async def get_pages_list(self, url: str) -> dict:
         """获取文档的所有页面列表（仅包含sitemap中的页面，与Web界面一致）"""
-        params = self.parse_url(url)
+        params = await self.resolve_url_params(url)
         doc_info = await self.get_document_info(params['project_id'], params['doc_id'])
 
         # 获取项目详细信息（包含创建者等信息）
@@ -3302,7 +3336,7 @@ class LanhuExtractor:
                 'output_dir': 输出目录
             }
         """
-        params = self.parse_url(url)
+        params = await self.resolve_url_params(url)
         doc_info = await self.get_document_info(params['project_id'], params['doc_id'])
 
         # 获取项目级mapping JSON
@@ -4565,7 +4599,11 @@ async def lanhu_resolve_invite_link(
             
             # 解析最终URL
             try:
-                params = LanhuExtractor.parse_url(final_url)
+                extractor = LanhuExtractor(lanhu_cookie, resolved_cookies.get("dds_cookie"))
+                try:
+                    params = await extractor.resolve_url_params(final_url)
+                finally:
+                    await extractor.close()
                 
                 return {
                     "status": "success",
@@ -4670,7 +4708,7 @@ def _get_analysis_mode_options_by_role(user_role: str) -> str:
 
 @mcp.tool()
 async def lanhu_get_pages(
-    url: Annotated[str, "Lanhu URL with docId parameter (indicates PRD/prototype document). Example: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx. Required params: tid or teamId, pid, docId. If you have an invite link, use lanhu_resolve_invite_link first!"],
+    url: Annotated[str, "Lanhu URL with docId parameter (indicates PRD/prototype document). Example: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx. Required params: pid, docId; tid/teamId is optional and will be fetched from current account settings when missing. If you have an invite link, use lanhu_resolve_invite_link first!"],
     ctx: Context = None
 ) -> dict:
     """
@@ -5358,7 +5396,7 @@ async def lanhu_get_ai_analyze_page_result(
             store.record_collaborator(user_name, user_role)
         
         # 解析URL获取文档ID
-        params = extractor.parse_url(url)
+        params = await extractor.resolve_url_params(url)
         doc_id = params['doc_id']
 
         # 设置输出目录（内部实现，自动管理）
@@ -5597,7 +5635,7 @@ async def lanhu_get_ai_analyze_page_result(
 async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
     """内部函数：获取设计图列表"""
     # 解析URL获取参数
-    params = extractor.parse_url(url)
+    params = await extractor.resolve_url_params(url)
 
     # 构建获取设计图列表的API URL
     api_url = (
@@ -5645,7 +5683,7 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
 
 @mcp.tool()
 async def lanhu_get_designs(
-    url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project, not PRD). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx. Required params: tid or teamId, pid (NO docId)"],
+    url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project, not PRD). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx. Required params: pid (NO docId); tid/teamId is optional and will be fetched from current account settings when missing."],
     ctx: Context = None
 ) -> dict:
     """
@@ -5836,7 +5874,7 @@ async def lanhu_get_ai_analyze_design_result(
             store.record_collaborator(user_name, user_role)
         
         # 解析URL获取参数
-        params = extractor.parse_url(url)
+        params = await extractor.resolve_url_params(url)
 
         # 获取设计图列表
         designs_data = await _get_designs_internal(extractor, url)
@@ -6272,7 +6310,7 @@ async def lanhu_get_design_slices(
             }
 
         # 2. 解析URL获取参数（提前解析，用于后续匹配和 API 调用）
-        params = extractor.parse_url(url)
+        params = await extractor.resolve_url_params(url)
         image_id_from_url = params.get('doc_id')  # parse_url 会把 image_id 解析为 doc_id
 
         # 3. 查找指定的设计图
@@ -6527,7 +6565,7 @@ async def lanhu_get_design_slices(
 
 @mcp.tool()
 async def lanhu_say(
-        url: Annotated[str, "蓝湖URL（含tid或teamId，以及pid）。例: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx。会自动提取项目和文档信息"],
+        url: Annotated[str, "蓝湖URL（含pid，tid/teamId可省略，缺失时自动从当前账号设置获取）。例: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx。会自动提取项目和文档信息"],
         summary: Annotated[str, "留言标题/概要"],
         content: Annotated[str, "留言详细内容"],
         mentions: Annotated[Optional[List[str]], "⚠️@提醒人名。必须是具体人名，例如: 张三/李四/王五/赵六等。禁止使用角色名(后端/前端等)！"] = None,
@@ -7019,7 +7057,7 @@ async def lanhu_say_detail(
 
 @mcp.tool()
 async def lanhu_say_edit(
-        url: Annotated[str, "蓝湖URL（含tid或teamId，以及pid）"],
+        url: Annotated[str, "蓝湖URL（含pid，tid/teamId可省略，缺失时自动从当前账号设置获取）"],
         message_id: Annotated[Any, "要编辑的消息ID"],
         summary: Annotated[Optional[str], "新标题（可选，不传则不修改）"] = None,
         content: Annotated[Optional[str], "新内容（可选，不传则不修改）"] = None,
@@ -7113,7 +7151,7 @@ async def lanhu_say_edit(
 
 @mcp.tool()
 async def lanhu_say_delete(
-        url: Annotated[str, "蓝湖URL（含tid或teamId，以及pid）"],
+        url: Annotated[str, "蓝湖URL（含pid，tid/teamId可省略，缺失时自动从当前账号设置获取）"],
         message_id: Annotated[Any, "要删除的消息ID"],
         ctx: Context = None
 ) -> dict:
@@ -7166,7 +7204,7 @@ async def lanhu_say_delete(
 
 @mcp.tool()
 async def lanhu_get_members(
-    url: Annotated[str, "蓝湖URL（含tid或teamId，以及pid）"],
+    url: Annotated[str, "蓝湖URL（含pid，tid/teamId可省略，缺失时自动从当前账号设置获取）"],
     ctx: Context = None
 ) -> dict:
     """
