@@ -2961,6 +2961,7 @@ class LanhuExtractor:
         2. 完整URL: https://lanhuapp.com/web/#/item/project/stage?tid=...&pid=...
         3. 参数部分: ?tid=...&pid=...
         4. 参数部分（无?）: tid=...&pid=...
+        5. 兼容 teamId: 当缺少 tid 但存在 teamId 时，将 teamId 当作 tid 使用
 
         Args:
             url: 蓝湖URL或参数字符串
@@ -2994,7 +2995,7 @@ class LanhuExtractor:
                 params[key] = value
 
         # 提取必需参数
-        team_id = params.get('tid')
+        team_id = params.get('tid') or params.get('teamId')
         project_id = params.get('pid')
         doc_id = params.get('docId') or params.get('image_id')
         version_id = params.get('versionId')
@@ -3004,7 +3005,7 @@ class LanhuExtractor:
             raise ValueError(f"URL parsing failed: missing required param pid (project_id)")
 
         if not team_id:
-            raise ValueError(f"URL parsing failed: missing required param tid (team_id)")
+            raise ValueError(f"URL parsing failed: missing required param tid/teamId (team_id)")
 
         return {
             'team_id': team_id,
@@ -4669,7 +4670,7 @@ def _get_analysis_mode_options_by_role(user_role: str) -> str:
 
 @mcp.tool()
 async def lanhu_get_pages(
-    url: Annotated[str, "Lanhu URL with docId parameter (indicates PRD/prototype document). Example: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx. Required params: tid, pid, docId. If you have an invite link, use lanhu_resolve_invite_link first!"],
+    url: Annotated[str, "Lanhu URL with docId parameter (indicates PRD/prototype document). Example: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx. Required params: tid or teamId, pid, docId. If you have an invite link, use lanhu_resolve_invite_link first!"],
     ctx: Context = None
 ) -> dict:
     """
@@ -5644,7 +5645,7 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
 
 @mcp.tool()
 async def lanhu_get_designs(
-    url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project, not PRD). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx. Required params: tid, pid (NO docId)"],
+    url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project, not PRD). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx. Required params: tid or teamId, pid (NO docId)"],
     ctx: Context = None
 ) -> dict:
     """
@@ -6526,7 +6527,7 @@ async def lanhu_get_design_slices(
 
 @mcp.tool()
 async def lanhu_say(
-        url: Annotated[str, "蓝湖URL（含tid和pid）。例: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx。会自动提取项目和文档信息"],
+        url: Annotated[str, "蓝湖URL（含tid或teamId，以及pid）。例: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx。会自动提取项目和文档信息"],
         summary: Annotated[str, "留言标题/概要"],
         content: Annotated[str, "留言详细内容"],
         mentions: Annotated[Optional[List[str]], "⚠️@提醒人名。必须是具体人名，例如: 张三/李四/王五/赵六等。禁止使用角色名(后端/前端等)！"] = None,
@@ -7018,7 +7019,7 @@ async def lanhu_say_detail(
 
 @mcp.tool()
 async def lanhu_say_edit(
-        url: Annotated[str, "蓝湖URL（含tid和pid）"],
+        url: Annotated[str, "蓝湖URL（含tid或teamId，以及pid）"],
         message_id: Annotated[Any, "要编辑的消息ID"],
         summary: Annotated[Optional[str], "新标题（可选，不传则不修改）"] = None,
         content: Annotated[Optional[str], "新内容（可选，不传则不修改）"] = None,
@@ -7112,7 +7113,7 @@ async def lanhu_say_edit(
 
 @mcp.tool()
 async def lanhu_say_delete(
-        url: Annotated[str, "蓝湖URL（含tid和pid）"],
+        url: Annotated[str, "蓝湖URL（含tid或teamId，以及pid）"],
         message_id: Annotated[Any, "要删除的消息ID"],
         ctx: Context = None
 ) -> dict:
@@ -7165,7 +7166,7 @@ async def lanhu_say_delete(
 
 @mcp.tool()
 async def lanhu_get_members(
-    url: Annotated[str, "蓝湖URL（含tid和pid）"],
+    url: Annotated[str, "蓝湖URL（含tid或teamId，以及pid）"],
     ctx: Context = None
 ) -> dict:
     """
