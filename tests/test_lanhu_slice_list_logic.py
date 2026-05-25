@@ -25,6 +25,12 @@ class _FastMCPStub:
 
         return decorator
 
+    def resource(self, *args, **kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
 
 class _AsyncClientStub:
     def __init__(self, *args, **kwargs):
@@ -36,6 +42,20 @@ def _install_import_stubs(monkeypatch):
     fastmcp.Context = object
     fastmcp.FastMCP = _FastMCPStub
     monkeypatch.setitem(sys.modules, "fastmcp", fastmcp)
+
+    apps = types.ModuleType("fastmcp.apps")
+
+    class _AppConfigStub:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class _ResourceCSPStub:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    apps.AppConfig = _AppConfigStub
+    apps.ResourceCSP = _ResourceCSPStub
+    monkeypatch.setitem(sys.modules, "fastmcp.apps", apps)
 
     utility_types = types.ModuleType("fastmcp.utilities.types")
     utility_types.Image = object

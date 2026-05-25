@@ -9,6 +9,7 @@ import re
 import base64
 import json
 import hashlib
+import secrets
 import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -33,7 +34,7 @@ except ImportError:
 
 # 东八区时区（北京时间）
 CHINA_TZ = timezone(timedelta(hours=8))
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 # 元数据缓存配置（基于版本号的永久缓存）
 _metadata_cache = {}  # {cache_key: {'data': {...}, 'version_id': str}}
@@ -43,6 +44,11 @@ from fastmcp import Context
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
+from prefab_ui.actions import ShowToast
+from prefab_ui.actions.mcp import CallTool
+from prefab_ui.app import PrefabApp
+from prefab_ui.components import Button, Card, CardContent, Checkbox, Column, Form, Heading, Image as PrefabImage, Row, Text
+from prefab_ui.rx import Rx
 from playwright.async_api import async_playwright
 
 # 创建FastMCP服务器
@@ -67,6 +73,44 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 _file_locks_guard = threading.Lock()
 _file_locks: Dict[str, threading.RLock] = {}
+_slice_selector_payloads: Dict[str, Dict[str, Any]] = {}
+
+
+class MCPContentTypeMiddleware:
+    """Normalize MCP HTTP content types for stricter clients and proxies."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path") or ""
+        headers = list(scope.get("headers") or [])
+        has_content_type = any(name.lower() == b"content-type" for name, _ in headers)
+        if path == "/mcp" and scope.get("method") == "POST" and not has_content_type:
+            scope = dict(scope)
+            scope["headers"] = [*headers, (b"content-type", b"application/json")]
+
+        async def send_with_content_type(message):
+            if message.get("type") == "http.response.start":
+                response_headers = list(message.get("headers") or [])
+                has_response_content_type = any(
+                    name.lower() == b"content-type" for name, _ in response_headers
+                )
+                if not has_response_content_type:
+                    media_type = (
+                        b"application/json; charset=utf-8"
+                        if path == "/mcp"
+                        else b"text/plain; charset=utf-8"
+                    )
+                    message = dict(message)
+                    message["headers"] = [*response_headers, (b"content-type", media_type)]
+            await send(message)
+
+        await self.app(scope, receive, send_with_content_type)
 
 # HTTP 请求超时时间（秒）
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
@@ -567,6 +611,601 @@ def _lanhu_slice_list_src(item: Dict[str, Any], enterprise: bool = False) -> str
         or item.get("svg")
         or ""
     )
+
+
+def _slice_file_extension(slice_info: Dict[str, Any]) -> str:
+    fmt = str(slice_info.get("format") or "").strip().lower()
+    if fmt in {"png", "jpg", "jpeg", "svg", "webp", "pdf"}:
+        return f".{fmt}"
+
+    url = str(slice_info.get("download_url") or slice_info.get("slice_list_src") or "")
+    path = urlparse(url).path
+    suffix = Path(path).suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".svg", ".webp", ".pdf"}:
+        return suffix
+    return ".png"
+
+
+def _slice_selector_filename(slice_info: Dict[str, Any], fallback_index: int, used_names: Set[str]) -> str:
+    raw_name = str(slice_info.get("name") or "").strip()
+    base = re.sub(r"[^A-Za-z0-9]+", "_", raw_name).strip("_").lower()
+    if not base:
+        base = f"slice_{fallback_index + 1}"
+
+    ext = _slice_file_extension(slice_info)
+    candidate = base if base.endswith(ext) else f"{base}{ext}"
+    if candidate not in used_names:
+        used_names.add(candidate)
+        return candidate
+
+    stem = candidate[: -len(ext)]
+    i = 2
+    while True:
+        deduped = f"{stem}_{i}{ext}"
+        if deduped not in used_names:
+            used_names.add(deduped)
+            return deduped
+        i += 1
+
+
+def _build_slice_selector_payload(slices_data: Dict[str, Any]) -> Dict[str, Any]:
+    used_names: Set[str] = set()
+    rows = []
+    for index, slice_info in enumerate(slices_data.get("slices") or []):
+        download_url = (
+            slice_info.get("download_url")
+            or slice_info.get("slice_list_src")
+            or slice_info.get("svg_url")
+            or ""
+        )
+        thumb_url = (
+            slice_info.get("slice_list_src")
+            or slice_info.get("download_url")
+            or slice_info.get("svg_url")
+            or ""
+        )
+        rows.append(
+            {
+                "key": f"{slice_info.get('id') or slice_info.get('name') or 'slice'}::{index}",
+                "id": slice_info.get("id"),
+                "name": slice_info.get("name") or f"slice {index + 1}",
+                "thumb_url": thumb_url,
+                "download_url": download_url,
+                "filename": _slice_selector_filename(slice_info, index, used_names),
+                "size": slice_info.get("size") or "",
+                "format": slice_info.get("format") or "",
+                "selected": bool(download_url),
+            }
+        )
+
+    return {
+        "status": slices_data.get("status", "success"),
+        "design_id": slices_data.get("design_id"),
+        "design_name": slices_data.get("design_name") or "",
+        "total_slices": len(rows),
+        "slices": rows,
+    }
+
+
+def _slice_selector_app_html() -> str:
+    return r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: Canvas; color: CanvasText; }
+    .app { min-height: 100vh; display: flex; flex-direction: column; }
+    .header { padding: 16px 18px 12px; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent); }
+    .title { margin: 0; font-size: 18px; line-height: 1.3; font-weight: 650; }
+    .meta { margin-top: 4px; color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 13px; }
+    .list { flex: 1; overflow: auto; padding-bottom: 82px; }
+    .row { display: grid; grid-template-columns: 44px minmax(130px, 1fr) 88px; align-items: center; gap: 12px; min-height: 82px; padding: 10px 18px; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); }
+    .row:hover { background: color-mix(in srgb, CanvasText 4%, transparent); }
+    .name { font-size: 14px; font-weight: 560; overflow-wrap: anywhere; }
+    .detail { margin-top: 4px; font-size: 12px; color: color-mix(in srgb, CanvasText 58%, transparent); }
+    .thumb { width: 72px; height: 56px; object-fit: contain; border-radius: 6px; background: color-mix(in srgb, CanvasText 7%, transparent); border: 1px solid color-mix(in srgb, CanvasText 10%, transparent); }
+    .empty { padding: 32px 18px; color: color-mix(in srgb, CanvasText 65%, transparent); }
+    .footer { position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; background: color-mix(in srgb, Canvas 92%, transparent); border-top: 1px solid color-mix(in srgb, CanvasText 12%, transparent); backdrop-filter: blur(10px); }
+    .status { font-size: 13px; color: color-mix(in srgb, CanvasText 66%, transparent); }
+    button { border: 0; border-radius: 6px; padding: 10px 14px; font-weight: 650; color: white; background: #2563eb; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    input[type="checkbox"] { width: 18px; height: 18px; }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="header">
+      <h1 class="title" id="title">Slices</h1>
+      <div class="meta" id="meta">Waiting for slice data...</div>
+    </section>
+    <section class="list" id="list"></section>
+    <section class="footer">
+      <div class="status" id="status">0 selected</div>
+      <button id="downloadButton" type="button" disabled>Download selected</button>
+    </section>
+  </main>
+
+  <script type="module">
+    import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@0.4.0/app-with-deps";
+
+    let slices = [];
+    const list = document.getElementById("list");
+    const title = document.getElementById("title");
+    const meta = document.getElementById("meta");
+    const status = document.getElementById("status");
+    const downloadButton = document.getElementById("downloadButton");
+
+    function readPayload(result) {
+      const structured = result?.structuredContent || result?.structured_content;
+      if (structured?.slice_selector) return structured.slice_selector;
+      if (structured?.slices) return structured;
+
+      const textBlock = result?.content?.find((item) => item.type === "text");
+      if (!textBlock?.text) return null;
+
+      try {
+        const parsed = JSON.parse(textBlock.text);
+        return parsed.slice_selector || parsed;
+      } catch {
+        return null;
+      }
+    }
+
+    function selectedSlices() {
+      const checked = [...document.querySelectorAll('[data-slice-checkbox]:checked')];
+      return checked
+        .map((input) => slices.find((slice) => slice.key === input.value))
+        .filter(Boolean);
+    }
+
+    function updateStatus() {
+      const count = selectedSlices().length;
+      status.textContent = `${count} selected`;
+      downloadButton.disabled = count === 0;
+    }
+
+    function render(payload) {
+      slices = payload?.slices || [];
+      title.textContent = payload?.design_name ? `${payload.design_name} slices` : "Slices";
+      meta.textContent = `${slices.length} slices available`;
+      list.replaceChildren();
+
+      if (!slices.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No downloadable slices were found.";
+        list.appendChild(empty);
+        updateStatus();
+        return;
+      }
+
+      for (const slice of slices) {
+        const row = document.createElement("label");
+        row.className = "row";
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.value = slice.key;
+        checkbox.checked = Boolean(slice.selected);
+        checkbox.disabled = !slice.download_url;
+        checkbox.dataset.sliceCheckbox = "true";
+        checkbox.addEventListener("change", updateStatus);
+
+        const text = document.createElement("div");
+        const name = document.createElement("div");
+        name.className = "name";
+        name.textContent = slice.name || slice.filename;
+        const detail = document.createElement("div");
+        detail.className = "detail";
+        detail.textContent = [slice.size, slice.format].filter(Boolean).join(" | ");
+        text.append(name, detail);
+
+        const img = document.createElement("img");
+        img.className = "thumb";
+        img.src = slice.thumb_url || slice.download_url || "";
+        img.alt = slice.name || "slice preview";
+        img.loading = "lazy";
+
+        row.append(checkbox, text, img);
+        list.appendChild(row);
+      }
+
+      updateStatus();
+    }
+
+    function triggerDownload(slice) {
+      const link = document.createElement("a");
+      link.href = slice.download_url;
+      link.download = slice.filename || "";
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    }
+
+    function downloadSelected() {
+      const selected = selectedSlices();
+      if (!selected.length) return;
+      status.textContent = `Downloading ${selected.length} selected...`;
+      selected.forEach((slice, index) => {
+        window.setTimeout(() => triggerDownload(slice), index * 180);
+      });
+    }
+
+    downloadButton.addEventListener("click", downloadSelected);
+
+    const app = new App({ name: "Lanhu Slice Selector", version: "1.0.0" });
+    app.ontoolresult = (result) => {
+      const payload = readPayload(result);
+      if (payload) render(payload);
+    };
+    await app.connect();
+  </script>
+</body>
+</html>"""
+
+
+def _standalone_slice_selector_html(payload: Dict[str, Any]) -> str:
+    bootstrap = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    return r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: Canvas; color: CanvasText; }
+    .app { min-height: 100vh; display: flex; flex-direction: column; }
+    .header { padding: 16px 18px 12px; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent); }
+    .title { margin: 0; font-size: 18px; line-height: 1.3; font-weight: 650; }
+    .meta { margin-top: 4px; color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 13px; }
+    .list { flex: 1; overflow: auto; padding-bottom: 82px; }
+    .row { display: grid; grid-template-columns: 44px minmax(130px, 1fr) 88px; align-items: center; gap: 12px; min-height: 82px; padding: 10px 18px; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); }
+    .row:hover { background: color-mix(in srgb, CanvasText 4%, transparent); }
+    .name { font-size: 14px; font-weight: 560; overflow-wrap: anywhere; }
+    .detail { margin-top: 4px; font-size: 12px; color: color-mix(in srgb, CanvasText 58%, transparent); }
+    .thumb { width: 72px; height: 56px; object-fit: contain; border-radius: 6px; background: color-mix(in srgb, CanvasText 7%, transparent); border: 1px solid color-mix(in srgb, CanvasText 10%, transparent); }
+    .empty { padding: 32px 18px; color: color-mix(in srgb, CanvasText 65%, transparent); }
+    .footer { position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; background: color-mix(in srgb, Canvas 92%, transparent); border-top: 1px solid color-mix(in srgb, CanvasText 12%, transparent); backdrop-filter: blur(10px); }
+    .status { font-size: 13px; color: color-mix(in srgb, CanvasText 66%, transparent); }
+    button { border: 0; border-radius: 6px; padding: 10px 14px; font-weight: 650; color: white; background: #2563eb; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    input[type="checkbox"] { width: 18px; height: 18px; }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="header">
+      <h1 class="title" id="title">Slices</h1>
+      <div class="meta" id="meta">Waiting for slice data...</div>
+    </section>
+    <section class="list" id="list"></section>
+    <section class="footer">
+      <div class="status" id="status">0 selected</div>
+      <button id="downloadButton" type="button" disabled>Confirm selection</button>
+    </section>
+  </main>
+
+  <script>
+    const BOOTSTRAP_PAYLOAD = """ + bootstrap + r""";
+    let slices = [];
+    const list = document.getElementById("list");
+    const title = document.getElementById("title");
+    const meta = document.getElementById("meta");
+    const status = document.getElementById("status");
+    const downloadButton = document.getElementById("downloadButton");
+
+    function selectedSlices() {
+      const checked = [...document.querySelectorAll('[data-slice-checkbox]:checked')];
+      return checked
+        .map((input) => slices.find((slice) => slice.key === input.value))
+        .filter(Boolean);
+    }
+
+    function updateStatus() {
+      const count = selectedSlices().length;
+      status.textContent = `${count} selected`;
+      downloadButton.disabled = count === 0;
+    }
+
+    function render(payload) {
+      slices = payload?.slices || [];
+      title.textContent = payload?.design_name ? `${payload.design_name} slices` : "Slices";
+      meta.textContent = `${slices.length} slices available`;
+      list.replaceChildren();
+
+      if (!slices.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No downloadable slices were found.";
+        list.appendChild(empty);
+        updateStatus();
+        return;
+      }
+
+      for (const slice of slices) {
+        const row = document.createElement("label");
+        row.className = "row";
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.value = slice.key;
+        checkbox.checked = Boolean(slice.selected);
+        checkbox.disabled = !slice.download_url;
+        checkbox.dataset.sliceCheckbox = "true";
+        checkbox.addEventListener("change", updateStatus);
+
+        const text = document.createElement("div");
+        const name = document.createElement("div");
+        name.className = "name";
+        name.textContent = slice.name || slice.filename;
+        const detail = document.createElement("div");
+        detail.className = "detail";
+        detail.textContent = [slice.size, slice.format].filter(Boolean).join(" | ");
+        text.append(name, detail);
+
+        const img = document.createElement("img");
+        img.className = "thumb";
+        img.src = slice.thumb_url || slice.download_url || "";
+        img.alt = slice.name || "slice preview";
+        img.loading = "lazy";
+
+        row.append(checkbox, text, img);
+        list.appendChild(row);
+      }
+
+      updateStatus();
+    }
+
+    async function submitSelection() {
+      const selected = selectedSlices();
+      if (!selected.length) return;
+      status.textContent = `Submitting ${selected.length} selected...`;
+      downloadButton.disabled = true;
+      const response = await fetch(`${window.location.pathname}/selection`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selected_keys: selected.map((slice) => slice.key) }),
+      });
+      if (!response.ok) {
+        status.textContent = "Selection failed. Please retry.";
+        updateStatus();
+        return;
+      }
+      status.textContent = `${selected.length} selected. You can return to Codex.`;
+    }
+
+    downloadButton.addEventListener("click", submitSelection);
+    render(BOOTSTRAP_PAYLOAD);
+  </script>
+</body>
+</html>"""
+
+
+def _slice_selector_public_url(selector_id: str) -> str:
+    base_url = os.getenv("SLICE_SELECTOR_BASE_URL")
+    if not base_url:
+        port = os.getenv("SERVER_PORT", "8000")
+        base_url = f"http://127.0.0.1:{port}"
+    return f"{base_url.rstrip('/')}/slice-selector/{selector_id}"
+
+
+def _slice_selector_asset_public_url(selector_id: str, key: str, kind: str) -> str:
+    encoded_key = quote(str(key), safe="")
+    return f"{_slice_selector_public_url(selector_id)}/asset/{encoded_key}?kind={kind}"
+
+
+def _rewrite_slice_selector_asset_urls(selector_id: str, payload: Dict[str, Any]) -> None:
+    for index, slice_info in enumerate(payload.get("slices", [])):
+        key = str(slice_info.get("key") or "")
+        slice_info.setdefault("prefab_state_key", f"s{index}")
+        thumb_url = slice_info.get("thumb_url") or slice_info.get("download_url") or ""
+        download_url = slice_info.get("download_url") or slice_info.get("thumb_url") or ""
+        slice_info["source_thumb_url"] = thumb_url
+        slice_info["source_download_url"] = download_url
+        if thumb_url:
+            slice_info["thumb_url"] = _slice_selector_asset_public_url(selector_id, key, "thumb")
+        if download_url:
+            slice_info["download_url"] = _slice_selector_asset_public_url(selector_id, key, "download")
+
+
+def _slice_selector_asset_headers(url: str, cookies: Optional[Dict[str, str]]) -> Dict[str, str]:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    use_dds_cookie = "dds.lanhuapp.com" in host
+    cookie = (cookies or {}).get("dds_cookie" if use_dds_cookie else "lanhu_cookie")
+    if not cookie:
+        cookie = (cookies or {}).get("lanhu_cookie") or (cookies or {}).get("dds_cookie") or ""
+    referer = "https://dds.lanhuapp.com/" if use_dds_cookie else "https://lanhuapp.com/web/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 LanhuSliceSelector/1.0",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": referer,
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def _slice_selector_asset_request(selector_id: str, key: str, kind: str) -> Dict[str, Any]:
+    payload = _slice_selector_payloads.get(selector_id)
+    if not payload:
+        return {"status": "error", "message": "Slice selector expired or not found."}
+
+    decoded_key = unquote(str(key))
+    target = None
+    for slice_info in payload.get("slices", []):
+        if str(slice_info.get("key")) == decoded_key:
+            target = slice_info
+            break
+    if not target:
+        return {"status": "error", "message": "Slice asset not found."}
+
+    source_field = "source_download_url" if kind == "download" else "source_thumb_url"
+    source_url = target.get(source_field) or target.get("source_download_url") or target.get("source_thumb_url")
+    if not source_url:
+        return {"status": "error", "message": "Slice asset URL is empty."}
+
+    return {
+        "status": "success",
+        "url": source_url,
+        "headers": _slice_selector_asset_headers(source_url, payload.get("_cookies")),
+        "filename": target.get("filename") or "",
+    }
+
+
+def _public_slice_selector_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if not str(key).startswith("_")
+    }
+
+
+def _prefab_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "checked"}
+    return bool(value)
+
+
+def _build_slice_selector_prefab_app(selector_id: str, payload: Dict[str, Any]) -> PrefabApp:
+    public_payload = _public_slice_selector_payload(payload)
+    slices = public_payload.get("slices") or []
+    selected_state = {
+        item.get("prefab_state_key") or f"s{index}": bool(item.get("selected"))
+        for index, item in enumerate(slices)
+    }
+
+    with PrefabApp(state={"selected": selected_state}) as app:
+        with Column(cssClass="p-4 gap-4 max-w-3xl mx-auto"):
+            Heading(public_payload.get("design_name") or "选择切图", level=2)
+            Text(f"共 {len(slices)} 个切图，勾选后点击确认。", cssClass="text-sm text-muted-foreground")
+            with Form(
+                onSubmit=CallTool(
+                    "lanhu_confirm_slice_selection",
+                    arguments={
+                        "selector_id": selector_id,
+                        "selected_state": Rx("selected"),
+                    },
+                    onSuccess=ShowToast(
+                        "已保存切图选择",
+                        description="可以继续后续下载逻辑。",
+                        variant="success",
+                    ),
+                ),
+                gap=3,
+            ):
+                for index, item in enumerate(slices):
+                    state_key = item.get("prefab_state_key") or f"s{index}"
+                    name = item.get("name") or item.get("filename") or f"slice {index + 1}"
+                    detail = " | ".join(
+                        part for part in (str(item.get("size") or ""), str(item.get("format") or "")) if part
+                    )
+                    with Card():
+                        with CardContent(cssClass="p-3"):
+                            with Row(align="center", gap=3):
+                                Checkbox(
+                                    name=f"selected.{state_key}",
+                                    value=f"{{{{ selected.{state_key} }}}}",
+                                    label="",
+                                    disabled=not bool(item.get("download_url")),
+                                )
+                                PrefabImage(
+                                    src=item.get("thumb_url") or item.get("download_url") or "",
+                                    alt=name,
+                                    width="72",
+                                    height="56",
+                                )
+                                with Column(gap=1):
+                                    Text(name, bold=True, cssClass="break-all")
+                                    if detail:
+                                        Text(detail, cssClass="text-xs text-muted-foreground")
+                with Row(cssClass="sticky bottom-0 bg-background border-t pt-3 mt-2 justify-end"):
+                    Button("下载选中的切图", buttonType="submit", variant="default")
+
+    return app
+
+
+def _confirm_slice_selector_selection(selector_id: str, selected_state: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _slice_selector_payloads.get(selector_id)
+    if not payload:
+        return {
+            "status": "error",
+            "message": "Slice selector expired or not found.",
+            "selected_count": 0,
+            "selected_slices": [],
+        }
+
+    selected_keys = []
+    for index, item in enumerate(payload.get("slices", [])):
+        state_key = item.get("prefab_state_key") or f"s{index}"
+        item_key = str(item.get("key"))
+        if _prefab_bool((selected_state or {}).get(state_key)) or _prefab_bool((selected_state or {}).get(item_key)):
+            selected_keys.append(str(item.get("key")))
+    return _submit_slice_selector_selection(selector_id, selected_keys)
+
+
+def _submit_slice_selector_selection(selector_id: str, selected_keys: List[str]) -> Dict[str, Any]:
+    payload = _slice_selector_payloads.get(selector_id)
+    if not payload:
+        return {
+            "status": "error",
+            "message": "Slice selector expired or not found.",
+            "selected_count": 0,
+            "selected_slices": [],
+        }
+
+    key_set = {str(key) for key in selected_keys}
+    selected_slices = [
+        slice_info
+        for slice_info in payload.get("slices", [])
+        if str(slice_info.get("key")) in key_set
+    ]
+    payload["selected_keys"] = [str(item.get("key")) for item in selected_slices]
+    payload["selected_slices"] = selected_slices
+    payload["selection_status"] = "selected"
+    return {
+        "status": "selected",
+        "selector_id": selector_id,
+        "selected_count": len(selected_slices),
+        "selected_slices": selected_slices,
+    }
+
+
+def _get_slice_selector_selection(selector_id: str) -> Dict[str, Any]:
+    payload = _slice_selector_payloads.get(selector_id)
+    if not payload:
+        return {
+            "status": "error",
+            "message": "Slice selector expired or not found.",
+            "selected_count": 0,
+            "selected_slices": [],
+        }
+    selected_slices = payload.get("selected_slices") or []
+    return {
+        "status": payload.get("selection_status") or "pending",
+        "selector_id": selector_id,
+        "selected_count": len(selected_slices),
+        "selected_slices": selected_slices,
+    }
+
+
+def _register_slice_selector_payload(payload: Dict[str, Any], cookies: Optional[Dict[str, str]] = None) -> Tuple[str, str]:
+    selector_id = secrets.token_urlsafe(16)
+    payload["selector_id"] = selector_id
+    payload["selection_status"] = "pending"
+    payload["_cookies"] = {
+        "lanhu_cookie": (cookies or {}).get("lanhu_cookie") or "",
+        "dds_cookie": (cookies or {}).get("dds_cookie") or (cookies or {}).get("lanhu_cookie") or "",
+    }
+    _rewrite_slice_selector_asset_urls(selector_id, payload)
+    _slice_selector_payloads[selector_id] = payload
+    return selector_id, _slice_selector_public_url(selector_id)
 
 
 def _should_use_flex(node: dict) -> bool:
@@ -6267,7 +6906,34 @@ async def lanhu_get_ai_analyze_design_result(
         await extractor.close()
 
 
-@mcp.tool()
+@mcp.custom_route("/slice-selector/{selector_id}/asset/{asset_key}", methods=["GET"])
+async def lanhu_slice_selector_asset(request):
+    from starlette.responses import Response, PlainTextResponse
+
+    selector_id = request.path_params.get("selector_id")
+    asset_key = request.path_params.get("asset_key")
+    kind = request.query_params.get("kind", "thumb")
+    asset_request = _slice_selector_asset_request(selector_id, asset_key, kind)
+    if asset_request.get("status") != "success":
+        return PlainTextResponse(asset_request.get("message", "Asset not found."), status_code=404)
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+            response = await client.get(asset_request["url"], headers=asset_request["headers"])
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type") or "application/octet-stream",
+            headers={
+                "Cache-Control": "private, max-age=300",
+                "Content-Disposition": f'inline; filename="{asset_request.get("filename") or "slice"}"',
+            },
+        )
+    except Exception as exc:
+        return PlainTextResponse(f"Failed to fetch slice asset: {exc}", status_code=502)
+
+
+@mcp.tool(app=True)
 async def lanhu_get_design_slices(
         url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx"],
         design_name: Annotated[str, "Exact design name (single design only, NOT 'all'). Example: '首页设计', '登录页'. Must match exactly with name from lanhu_get_designs result!"],
@@ -6546,11 +7212,12 @@ async def lanhu_get_design_slices(
             ]
         }
 
-        return {
+        slice_selector = _build_slice_selector_payload({
             'status': 'success',
             **slices_data,
-            'ai_workflow_guide': ai_workflow_guide
-        }
+        })
+        selector_id, _ = _register_slice_selector_payload(slice_selector, cookies=cookies)
+        return _build_slice_selector_prefab_app(selector_id, slice_selector)
 
     except Exception as e:
         return {
@@ -6559,6 +7226,36 @@ async def lanhu_get_design_slices(
         }
     finally:
         await extractor.close()
+
+
+@mcp.tool()
+async def lanhu_confirm_slice_selection(
+        selector_id: Annotated[str, "Selector ID returned by lanhu_get_design_slices."],
+        selected_state: Annotated[Dict[str, Any], "Prefab checkbox state map. Values with true/on/checked are selected."],
+        ctx: Context = None
+) -> dict:
+    """
+    Confirm slice choices from the Prefab selector UI.
+
+    This tool is called by the Prefab form. It stores the user's selected
+    slices and returns only the selected slice rows for downstream download.
+    """
+    return _confirm_slice_selector_selection(selector_id, selected_state)
+
+
+@mcp.tool()
+async def lanhu_get_slice_selection(
+        selector_id: Annotated[str, "Selector ID returned by lanhu_get_design_slices. Call after the user confirms slice choices in the browser page."],
+        ctx: Context = None
+) -> dict:
+    """
+    Get the user's confirmed slice selection from the browser selector page.
+
+    Use after lanhu_get_design_slices returns selector_id and the user clicks
+    Confirm selection in the opened slice selector page. Returns only the
+    selected slices so the agent can continue the download workflow.
+    """
+    return _get_slice_selector_selection(selector_id)
 
 
 # ==================== 团队留言板功能 ====================
@@ -7256,7 +7953,15 @@ if __name__ == "__main__":
     if MCP_TRANSPORT == "stdio":
         mcp.run(transport="stdio")
     else:
+        from starlette.middleware import Middleware as ASGIMiddleware
+
         SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
         SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
-        mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
+        mcp.run(
+            transport="http",
+            path="/mcp",
+            host=SERVER_HOST,
+            port=SERVER_PORT,
+            middleware=[ASGIMiddleware(MCPContentTypeMiddleware)],
+        )
 
