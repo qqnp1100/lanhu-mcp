@@ -9,9 +9,10 @@ import re
 import base64
 import json
 import hashlib
+import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Annotated, Optional, Union, List, Any
+from typing import Annotated, Optional, Union, List, Any, Dict, Iterable, Set, Tuple
 
 # 加载 .env 文件中的环境变量（必须在其他导入之前）
 # 注意：在 Docker 容器中，环境变量通常已由 docker-compose 通过 env_file 设置
@@ -50,13 +51,11 @@ mcp = FastMCP("Lanhu Axure Extractor")
 # 全局配置
 DEFAULT_COOKIE = "your_lanhu_cookie_here"  # 请替换为你的蓝湖Cookie，从浏览器开发者工具中获取
 
-# 从环境变量读取Cookie，如果没有则使用默认值
-COOKIE = os.getenv("LANHU_COOKIE", DEFAULT_COOKIE)
-
 BASE_URL = "https://lanhuapp.com"
 DDS_BASE_URL = "https://dds.lanhuapp.com"
 CDN_URL = "https://axure-file.lanhuapp.com"
-DDS_COOKIE = os.getenv("DDS_COOKIE", COOKIE)
+LANHU_COOKIE_HEADER_NAMES = ("X-Lanhu-Cookie", "Lanhu-Cookie", "LANHU_COOKIE")
+DDS_COOKIE_HEADER_NAMES = ("X-Lanhu-DDS-Cookie", "DDS_COOKIE")
 
 # 飞书机器人Webhook配置（支持环境变量）
 DEFAULT_FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-key-here"
@@ -65,6 +64,9 @@ FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", DEFAULT_FEISHU_WEBHOOK)
 # 数据存储目录
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+_file_locks_guard = threading.Lock()
+_file_locks: Dict[str, threading.RLock] = {}
 
 # HTTP 请求超时时间（秒）
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
@@ -282,6 +284,289 @@ def _merge_margin(styles: dict) -> None:
         
         for k in ['marginTop', 'marginRight', 'marginBottom', 'marginLeft']:
             styles.pop(k, None)
+
+
+_LANHU_RASTER_FILE_TYPES = {"PNG", "JPG", "WEBP"}
+_LANHU_VECTOR_FILE_TYPES = {"SVG", "PDF"}
+
+
+def _lanhu_first_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _lanhu_nested_get(obj: Dict[str, Any], *path: str) -> Any:
+    cur: Any = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _lanhu_layer_width(layer: Dict[str, Any]) -> Any:
+    return _lanhu_first_value(
+        layer.get("width"),
+        _lanhu_nested_get(layer, "frame", "width"),
+        _lanhu_nested_get(layer, "realFrame", "width"),
+        _lanhu_nested_get(layer, "bounds", "width"),
+    )
+
+
+def _lanhu_layer_height(layer: Dict[str, Any]) -> Any:
+    return _lanhu_first_value(
+        layer.get("height"),
+        _lanhu_nested_get(layer, "frame", "height"),
+        _lanhu_nested_get(layer, "realFrame", "height"),
+        _lanhu_nested_get(layer, "bounds", "height"),
+    )
+
+
+def _lanhu_layer_left(layer: Dict[str, Any]) -> Any:
+    return _lanhu_first_value(
+        layer.get("left"),
+        layer.get("x"),
+        _lanhu_nested_get(layer, "frame", "x"),
+        _lanhu_nested_get(layer, "realFrame", "x"),
+        _lanhu_nested_get(layer, "bounds", "x"),
+        _lanhu_nested_get(layer, "bounds", "left"),
+    )
+
+
+def _lanhu_layer_top(layer: Dict[str, Any]) -> Any:
+    return _lanhu_first_value(
+        layer.get("top"),
+        layer.get("y"),
+        _lanhu_nested_get(layer, "frame", "y"),
+        _lanhu_nested_get(layer, "realFrame", "y"),
+        _lanhu_nested_get(layer, "bounds", "y"),
+        _lanhu_nested_get(layer, "bounds", "top"),
+    )
+
+
+def _lanhu_iter_dicts(value: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _lanhu_iter_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _lanhu_iter_dicts(child)
+
+
+def _lanhu_iter_layer_tree(value: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for child_key in ("layers", "children"):
+            children = value.get(child_key)
+            if isinstance(children, list):
+                for child in children:
+                    yield from _lanhu_iter_layer_tree(child)
+
+
+def _lanhu_frontend_layer_list(data: Any) -> List[Dict[str, Any]]:
+    """Return the layer list Lanhu feeds into the slice panel."""
+    if not isinstance(data, dict):
+        return [item for item in _lanhu_iter_dicts(data)]
+
+    # Lanhu's detail page builds LayerBox.sliceIndex from the normalized
+    # layer array used by the active design type: g.info for PS/plugin JSON and
+    # g.array for older Sketch JSON. Some JSON payloads also contain an
+    # artboard tree, but the web slice panel does not use that tree when the
+    # normalized list is present.
+    info = data.get("info")
+    if isinstance(info, list):
+        return [item for item in info if isinstance(item, dict)]
+
+    array = data.get("array")
+    if isinstance(array, list):
+        return [item for item in array if isinstance(item, dict)]
+
+    artboard = data.get("artboard")
+    if isinstance(artboard, dict) and isinstance(artboard.get("layers"), list):
+        return [
+            layer
+            for child in artboard["layers"]
+            for layer in _lanhu_iter_layer_tree(child)
+            if isinstance(layer, dict)
+        ]
+
+    return [item for item in _lanhu_iter_dicts(data)]
+
+
+def _lanhu_root_ids(data: Any) -> Set[Any]:
+    if not isinstance(data, dict):
+        return set()
+    return {
+        value
+        for value in (
+            data.get("ArtboardID"),
+            _lanhu_nested_get(data, "artboard", "id"),
+            _lanhu_nested_get(data, "artboard", "objectID"),
+        )
+        if value
+    }
+
+
+def _lanhu_looks_like_artboard_background(layer: Dict[str, Any], root_ids: Set[Any]) -> bool:
+    name = str(layer.get("name") or "").strip().lower()
+    if name not in {"背景", "background", "bg"}:
+        return False
+    return layer.get("parentID") in root_ids or layer.get("parentId") in root_ids
+
+
+def _lanhu_build_slice_item(
+    *,
+    index: int,
+    web_id: Any,
+    name: Any,
+    url: Any,
+    svg: Any,
+    asset: Dict[str, Any],
+    layer: Dict[str, Any],
+    asset_key: str,
+) -> Dict[str, Any]:
+    item: Dict[str, Any] = {
+        "index": index,
+        "name": name or "",
+        "url": url or "",
+        "svg": svg or "",
+        asset_key: asset,
+        "width": _lanhu_layer_width(layer) or 0,
+        "height": _lanhu_layer_height(layer) or 0,
+        "web_id": web_id,
+        "isSelected": True,
+        "isNameEditing": False,
+    }
+
+    left = _lanhu_layer_left(layer)
+    top = _lanhu_layer_top(layer)
+    if left is not None:
+        item["left"] = left
+    if top is not None:
+        item["top"] = top
+
+    org_url = asset.get("orgUrl")
+    if org_url:
+        item["orgUrl"] = org_url
+
+    if asset.get("isNew"):
+        if asset.get("svgUrl"):
+            item["svgUrl"] = asset.get("svgUrl")
+        if asset.get("imageUrl"):
+            item["imageUrl"] = asset.get("imageUrl")
+
+    item["hasSvg"] = bool(item.get("svg") or item.get("svgUrl"))
+    return item
+
+
+def _lanhu_extract_ps_asset(layer: Dict[str, Any], index: int, web_id: Any) -> Optional[Dict[str, Any]]:
+    images = layer.get("images")
+    if not layer.get("isAsset") or not isinstance(images, dict):
+        return None
+
+    url = images.get("png_xxxhd")
+    if not url:
+        return None
+
+    # Lanhu frontend skips placeholder slice urls ending in "/0".
+    if isinstance(url, str) and url[-2:] == "/0":
+        return None
+
+    return _lanhu_build_slice_item(
+        index=index,
+        web_id=web_id,
+        name=layer.get("name"),
+        url=url,
+        svg=images.get("svg"),
+        asset=images,
+        layer=layer,
+        asset_key="images",
+    )
+
+
+def _lanhu_extract_image_asset(layer: Dict[str, Any], index: int, web_id: Any) -> Optional[Dict[str, Any]]:
+    image = layer.get("image")
+    if not isinstance(image, dict):
+        return None
+
+    return _lanhu_build_slice_item(
+        index=index,
+        web_id=web_id,
+        name=layer.get("name"),
+        url=image.get("bitmap"),
+        svg=image.get("svg") or "",
+        asset=image,
+        layer=layer,
+        asset_key="image",
+    )
+
+
+def _lanhu_slice_dedupe_key(item: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    return (item.get("web_id"), item.get("name"), item.get("url") or item.get("imageUrl"))
+
+
+def _extract_lanhu_slice_index(
+    data: Any,
+    *,
+    include_artboard_background: bool = True,
+    dedupe: bool = False,
+) -> List[Dict[str, Any]]:
+    """Mirror Lanhu's AllSliceList sliceIndex input as closely as possible."""
+    items: List[Dict[str, Any]] = []
+    seen: Set[Tuple[Any, Any, Any]] = set()
+    root_ids = _lanhu_root_ids(data)
+
+    for index, layer in enumerate(_lanhu_frontend_layer_list(data)):
+        if not include_artboard_background and _lanhu_looks_like_artboard_background(layer, root_ids):
+            continue
+
+        web_id = _lanhu_first_value(layer.get("web_id"), index + 1)
+        item = _lanhu_extract_ps_asset(layer, index, web_id) or _lanhu_extract_image_asset(layer, index, web_id)
+        if not item:
+            continue
+
+        key = _lanhu_slice_dedupe_key(item)
+        if dedupe and key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+
+    return items
+
+
+def _lanhu_visible_in_slice_list(item: Dict[str, Any], active_file_type: str = "PNG") -> bool:
+    active_file_type = (active_file_type or "PNG").strip().upper()
+    if active_file_type in _LANHU_RASTER_FILE_TYPES:
+        return True
+    if active_file_type in _LANHU_VECTOR_FILE_TYPES:
+        return bool(item.get("hasSvg"))
+    return False
+
+
+def _lanhu_slice_list_src(item: Dict[str, Any], enterprise: bool = False) -> str:
+    """Mirror AllSliceList.computed.sliceListSrc URL priority."""
+    if enterprise:
+        return (
+            item.get("format_url")
+            or item.get("format_base64")
+            or item.get("imageUrl")
+            or item.get("url")
+            or item.get("orgUrl")
+            or item.get("svg")
+            or ""
+        )
+    return (
+        item.get("format_url")
+        or item.get("imageUrl")
+        or item.get("url")
+        or item.get("orgUrl")
+        or item.get("format_base64")
+        or item.get("svg")
+        or ""
+    )
 
 
 def _should_use_flex(node: dict) -> bool:
@@ -884,9 +1169,172 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         m = re.search(r'(\d+)', style_name)
         return int(m.group(1)) if m else None
 
+    def raw_layer_frame(layer):
+        frame = layer.get('layerOriginFrame') or layer.get('ddsOriginFrame') or {}
+        return {
+            'left': layer.get('left', frame.get('x', 0)) or 0,
+            'top': layer.get('top', frame.get('y', 0)) or 0,
+            'width': layer.get('width', frame.get('width', 0)) or 0,
+            'height': layer.get('height', frame.get('height', 0)) or 0,
+        }
+
+    def raw_layer_image_url(layer):
+        images = layer.get('images')
+        if isinstance(images, dict):
+            url = images.get('png_xxxhd') or images.get('svg')
+            if url:
+                return url
+
+        image = layer.get('image')
+        if isinstance(image, dict):
+            url = (
+                image.get('bitmap')
+                or image.get('imageUrl')
+                or image.get('url')
+                or image.get('svg')
+                or image.get('svgUrl')
+            )
+            if url:
+                return url
+
+        dds_image = layer.get('ddsImage')
+        if isinstance(dds_image, dict):
+            url = dds_image.get('imageUrl') or dds_image.get('svgUrl')
+            if url:
+                return url
+
+        return ''
+
+    def raw_text_info(layer):
+        font = layer.get('font') or {}
+        styles = font.get('styles') or []
+        first_style = styles[0] if styles and isinstance(styles[0], dict) else {}
+        content = (
+            font.get('content')
+            or ''.join(str(style.get('content', '')) for style in styles if isinstance(style, dict))
+            or layer.get('name', '')
+        )
+        align_value = font.get('align', font.get('textAlignment'))
+        if align_value == 2:
+            justification = 'center'
+        elif align_value == 1:
+            justification = 'right'
+        elif isinstance(align_value, str):
+            justification = align_value
+        else:
+            justification = 'left'
+
+        return {
+            'text': content,
+            'color': font.get('color') or first_style.get('color'),
+            'size': font.get('size') or first_style.get('size') or layer.get('height'),
+            'fontPostScriptName': (
+                font.get('font')
+                or first_style.get('font')
+                or font.get('displayName')
+                or first_style.get('displayName')
+            ),
+            'fontStyleName': str(first_style.get('fontWeight') or ''),
+            'bold': first_style.get('fontWeight', 0) >= 600,
+            'italic': False,
+            'justification': justification,
+        }
+
+    def raw_first_fill(layer):
+        for fill in layer.get('fills') or []:
+            if fill.get('isEnabled', True) and fill.get('color'):
+                return {'color': fill.get('color')}
+        return {}
+
+    def adapt_raw_layer(layer):
+        old_type = layer.get('type') or layer.get('ddsType') or ''
+        mapped_type = {
+            'text': 'textLayer',
+            'bitmap': 'bitmap',
+            'shape': 'shape',
+            'layer-group': 'layerSection',
+        }.get(old_type, old_type)
+        frame = raw_layer_frame(layer)
+        adapted = {
+            'name': layer.get('name', ''),
+            'type': mapped_type,
+            'left': frame['left'],
+            'top': frame['top'],
+            'width': frame['width'],
+            'height': frame['height'],
+            'visible': layer.get('isVisible', True),
+            'blendOptions': {'opacity': {'value': layer.get('opacity', 100)}},
+        }
+
+        if old_type == 'text':
+            adapted['textInfo'] = raw_text_info(layer)
+        else:
+            url = raw_layer_image_url(layer)
+            if url:
+                adapted['images'] = {'png_xxxhd': url}
+            fill = raw_first_fill(layer)
+            if fill:
+                adapted['fill'] = fill
+
+        return adapted
+
+    def build_board_from_info(data):
+        info = data.get('info') or []
+        children_by_parent = {}
+        for layer in info:
+            parent_id = layer.get('parentID')
+            if parent_id:
+                children_by_parent.setdefault(parent_id, []).append(layer)
+
+        artboard = next(
+            (
+                layer for layer in info
+                if layer.get('ddsType') == 'artboard-group' or layer.get('id') == data.get('ArtboardID')
+            ),
+            info[0] if info else {},
+        )
+
+        raw_layers = []
+        for layer in info:
+            old_type = layer.get('type') or layer.get('ddsType') or ''
+            if old_type == 'artboard-group' or layer.get('isVisible') is False:
+                continue
+            if old_type == 'layer-group' and children_by_parent.get(layer.get('id')) and not raw_layer_image_url(layer):
+                continue
+            if old_type in {'text', 'bitmap', 'shape', 'layer-group'}:
+                raw_layers.append(adapt_raw_layer(layer))
+
+        return {
+            'width': artboard.get('width', 750),
+            'height': artboard.get('height', 1334),
+            'layers': list(reversed(raw_layers)),
+        }
+
     layers = []
     board_w = 375
     board_h = 667
+
+    def _flatten(layer):
+        if not layer or not isinstance(layer, dict):
+            return
+        if layer.get('visible') is False:
+            return
+        w = layer.get('width', 0) or 0
+        h = layer.get('height', 0) or 0
+        if w == 0 and h == 0:
+            for child in reversed(layer.get('layers', [])):
+                _flatten(child)
+            return
+        ltype = layer.get('type', '')
+        if ltype == 'layerSection':
+            images = layer.get('images') or {}
+            if images.get('png_xxxhd') or images.get('svg'):
+                layers.append(layer)
+            else:
+                for child in reversed(layer.get('layers', [])):
+                    _flatten(child)
+            return
+        layers.append(layer)
 
     if 'board' in sketch_data:
         board = sketch_data['board']
@@ -894,27 +1342,13 @@ def convert_sketch_to_html(sketch_data: dict, design_scale: float = 2.0,
         board_h = px(board.get('height', 1334))
         raw_layers = board.get('layers', [])
 
-        def _flatten(layer):
-            if not layer or not isinstance(layer, dict):
-                return
-            if layer.get('visible') is False:
-                return
-            w = layer.get('width', 0) or 0
-            h = layer.get('height', 0) or 0
-            if w == 0 and h == 0:
-                for child in reversed(layer.get('layers', [])):
-                    _flatten(child)
-                return
-            ltype = layer.get('type', '')
-            if ltype == 'layerSection':
-                images = layer.get('images') or {}
-                if images.get('png_xxxhd') or images.get('svg'):
-                    layers.append(layer)
-                else:
-                    for child in reversed(layer.get('layers', [])):
-                        _flatten(child)
-                return
-            layers.append(layer)
+        for l in reversed(raw_layers):
+            _flatten(l)
+    elif isinstance(sketch_data.get('info'), list):
+        board = build_board_from_info(sketch_data)
+        board_w = px(board.get('width', 750))
+        board_h = px(board.get('height', 1334))
+        raw_layers = board.get('layers', [])
 
         for l in reversed(raw_layers):
             _flatten(l)
@@ -1599,11 +2033,54 @@ def normalize_role(role: str) -> str:
     return role
 
 
-def _get_metadata_cache_key(project_id: str, doc_id: str = None) -> str:
+def _safe_cache_segment(value: Any, fallback: str = "unknown") -> str:
+    value = str(value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
+    return value[:120] or fallback
+
+
+def _get_file_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _file_locks_guard:
+        lock = _file_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _file_locks[key] = lock
+        return lock
+
+
+def _get_cookie_cache_scope(cookies: Optional[dict]) -> str:
+    if not cookies:
+        return "default"
+    raw_scope = "|".join(
+        _normalize_cookie_value(cookies.get(name)) or ""
+        for name in ("lanhu_cookie", "dds_cookie")
+    )
+    return hashlib.sha256(raw_scope.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_axure_cache_dirs(doc_id: str, cookies: Optional[dict]) -> Tuple[str, str]:
+    scope = _get_cookie_cache_scope(cookies)
+    doc_segment = _safe_cache_segment(doc_id)
+    base_dir = DATA_DIR / "axure_extract" / scope / doc_segment
+    screenshot_dir = DATA_DIR / "axure_extract_screenshots" / scope / doc_segment
+    return str(base_dir), str(screenshot_dir)
+
+
+def _get_design_cache_dir(project_id: str, cookies: Optional[dict]) -> Path:
+    scope = _get_cookie_cache_scope(cookies)
+    return DATA_DIR / "lanhu_designs" / scope / _safe_cache_segment(project_id)
+
+
+def _get_metadata_cache_key(project_id: str, doc_id: str = None, cache_scope: str = None) -> str:
     """生成元数据缓存键（不含版本号，用于查找）"""
+    parts = []
+    if cache_scope:
+        parts.append(_safe_cache_segment(cache_scope))
+    parts.append(_safe_cache_segment(project_id))
     if doc_id:
-        return f"{project_id}_{doc_id}"
-    return project_id
+        parts.append(_safe_cache_segment(doc_id))
+    return "_".join(parts)
 
 
 def _get_cached_metadata(cache_key: str, version_id: str = None) -> Optional[dict]:
@@ -1828,31 +2305,63 @@ class MessageStore:
         
         if project_id:
             self.file_path = self.storage_dir / f"{project_id}.json"
+            self._lock = _get_file_lock(self.file_path)
             self._data = self._load()
         else:
             # 全局模式，不加载单个文件
             self.file_path = None
+            self._lock = None
             self._data = None
     
-    def _load(self) -> dict:
-        """加载项目数据"""
-        if self.file_path.exists():
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
+    def _empty_data(self) -> dict:
         return {
             "project_id": self.project_id,
             "next_id": 1,
             "messages": [],
             "collaborators": []
         }
+
+    def _load_unlocked(self) -> dict:
+        if self.file_path and self.file_path.exists():
+            try:
+                with open(self.file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return self._empty_data()
+
+    def _save_unlocked(self):
+        if not self.file_path:
+            return
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.file_path.with_name(
+            f".{self.file_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.file_path)
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
+    def _load(self) -> dict:
+        """加载项目数据"""
+        if self._lock:
+            with self._lock:
+                return self._load_unlocked()
+        return self._load_unlocked()
     
     def _save(self):
         """保存项目数据"""
-        with open(self.file_path, 'w', encoding='utf-8') as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
+        if self._lock:
+            with self._lock:
+                self._save_unlocked()
+        else:
+            self._save_unlocked()
     
     def _get_now(self) -> str:
         """获取当前时间字符串（东八区/北京时间）"""
@@ -1879,6 +2388,13 @@ class MessageStore:
         return False
     
     def record_collaborator(self, name: str, role: str):
+        if not self._lock:
+            return
+        with self._lock:
+            self._data = self._load_unlocked()
+            return self._record_collaborator_unlocked(name, role)
+
+    def _record_collaborator_unlocked(self, name: str, role: str):
         """记录/更新协作者"""
         if not name or not role:
             return
@@ -1890,7 +2406,7 @@ class MessageStore:
         for collab in collaborators:
             if collab["name"] == name and collab["role"] == role:
                 collab["last_seen"] = now
-                self._save()
+                self._save_unlocked()
                 return
         
         # 新增协作者
@@ -1901,13 +2417,34 @@ class MessageStore:
             "last_seen": now
         })
         self._data["collaborators"] = collaborators
-        self._save()
+        self._save_unlocked()
     
     def get_collaborators(self) -> List[dict]:
         """获取协作者列表"""
+        if self._lock:
+            with self._lock:
+                self._data = self._load_unlocked()
         return self._data.get("collaborators", [])
+
+    def update_project_metadata(self, project_name: str = None, folder_name: str = None):
+        with self._lock:
+            self._data = self._load_unlocked()
+            changed = False
+            if project_name and not self._data.get("project_name"):
+                self._data["project_name"] = project_name
+                changed = True
+            if folder_name and not self._data.get("folder_name"):
+                self._data["folder_name"] = folder_name
+                changed = True
+            if changed:
+                self._save_unlocked()
     
-    def save_message(self, summary: str, content: str, author_name: str, 
+    def save_message(self, *args, **kwargs) -> dict:
+        with self._lock:
+            self._data = self._load_unlocked()
+            return self._save_message_unlocked(*args, **kwargs)
+
+    def _save_message_unlocked(self, summary: str, content: str, author_name: str, 
                      author_role: str, mentions: List[str] = None,
                      message_type: str = 'normal',
                      project_name: str = None, folder_name: str = None,
@@ -1963,11 +2500,14 @@ class MessageStore:
         }
         
         self._data["messages"].append(message)
-        self._save()
+        self._save_unlocked()
         return message
     
     def get_messages(self, user_role: str = None) -> List[dict]:
         """获取所有消息（不含content，用于列表展示）"""
+        if self._lock:
+            with self._lock:
+                self._data = self._load_unlocked()
         messages = []
         for msg in self._data.get("messages", []):
             msg_copy = {k: v for k, v in msg.items() if k != "content"}
@@ -1979,6 +2519,9 @@ class MessageStore:
         return messages
     
     def get_message_by_id(self, msg_id: int, user_role: str = None) -> Optional[dict]:
+        if self._lock:
+            with self._lock:
+                self._data = self._load_unlocked()
         """根据ID获取消息（含content）"""
         for msg in self._data.get("messages", []):
             if msg["id"] == msg_id:
@@ -1988,7 +2531,12 @@ class MessageStore:
                 return msg_copy
         return None
     
-    def update_message(self, msg_id: int, editor_name: str, editor_role: str,
+    def update_message(self, *args, **kwargs) -> Optional[dict]:
+        with self._lock:
+            self._data = self._load_unlocked()
+            return self._update_message_unlocked(*args, **kwargs)
+
+    def _update_message_unlocked(self, msg_id: int, editor_name: str, editor_role: str,
                        summary: str = None, content: str = None, 
                        mentions: List[str] = None) -> Optional[dict]:
         """更新消息"""
@@ -2003,17 +2551,22 @@ class MessageStore:
                 msg["updated_at"] = self._get_now()
                 msg["updated_by_name"] = editor_name
                 msg["updated_by_role"] = editor_role
-                self._save()
+                self._save_unlocked()
                 return msg
         return None
     
     def delete_message(self, msg_id: int) -> bool:
+        with self._lock:
+            self._data = self._load_unlocked()
+            return self._delete_message_unlocked(msg_id)
+
+    def _delete_message_unlocked(self, msg_id: int) -> bool:
         """删除消息"""
         messages = self._data.get("messages", [])
         for i, msg in enumerate(messages):
             if msg["id"] == msg_id:
                 messages.pop(i)
-                self._save()
+                self._save_unlocked()
                 return True
         return False
     
@@ -2150,6 +2703,92 @@ def get_user_info(ctx: Context) -> tuple:
     return '匿名', '未知'
 
 
+class LanhuCookieNotConfigured(Exception):
+    """Raised when the current MCP request has no usable Lanhu cookie."""
+
+
+def _normalize_cookie_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value or None
+
+
+def _is_cookie_configured(value: Optional[str]) -> bool:
+    value = _normalize_cookie_value(value)
+    return bool(value and value != DEFAULT_COOKIE)
+
+
+def _get_http_header_value(header_names: Tuple[str, ...]) -> Optional[str]:
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        req = get_http_request()
+        headers = getattr(req, "headers", None)
+        if not headers:
+            return None
+        for name in header_names:
+            value = headers.get(name)
+            if _is_cookie_configured(value):
+                return _normalize_cookie_value(value)
+    except Exception:
+        pass
+    return None
+
+
+def get_current_lanhu_cookies() -> dict:
+    """
+    Resolve cookies for the current MCP call.
+
+    Priority:
+    1. HTTP request headers (for shared HTTP MCP servers)
+    2. Process environment variables (for stdio or single-user fallback)
+    """
+    lanhu_cookie = _get_http_header_value(LANHU_COOKIE_HEADER_NAMES)
+    if not _is_cookie_configured(lanhu_cookie):
+        lanhu_cookie = _normalize_cookie_value(os.getenv("LANHU_COOKIE"))
+
+    if not _is_cookie_configured(lanhu_cookie):
+        raise LanhuCookieNotConfigured(
+            "LANHU_COOKIE is not configured. Configure it in your MCP client env for stdio, "
+            "or send X-Lanhu-Cookie in headers for shared HTTP MCP."
+        )
+
+    dds_cookie = _get_http_header_value(DDS_COOKIE_HEADER_NAMES)
+    if not _is_cookie_configured(dds_cookie):
+        dds_cookie = _normalize_cookie_value(os.getenv("DDS_COOKIE"))
+    if not _is_cookie_configured(dds_cookie):
+        dds_cookie = lanhu_cookie
+
+    return {
+        "lanhu_cookie": lanhu_cookie,
+        "dds_cookie": dds_cookie,
+    }
+
+
+def lanhu_cookie_error_response(error: Exception = None) -> dict:
+    return {
+        "status": "error",
+        "error": "LANHU_COOKIE_NOT_CONFIGURED",
+        "message": str(error) if error else (
+            "LANHU_COOKIE is not configured. Configure it in your MCP client env for stdio, "
+            "or send X-Lanhu-Cookie in headers for shared HTTP MCP."
+        ),
+        "stdio_example": {
+            "env": {
+                "MCP_TRANSPORT": "stdio",
+                "LANHU_COOKIE": "your_lanhu_cookie_here",
+            }
+        },
+        "http_example": {
+            "headers": {
+                "X-Lanhu-Cookie": "your_lanhu_cookie_here",
+            }
+        },
+    }
+
+
 def _clean_message_dict(msg: dict, current_user_name: str = None) -> dict:
     """
     清理消息字典，移除null值的更新字段，并添加快捷标志
@@ -2181,12 +2820,11 @@ def get_project_id_from_url(url: str) -> str:
     """从URL中提取project_id"""
     if not url or url.lower() == 'all':
         return None
-    extractor = LanhuExtractor()
-    params = extractor.parse_url(url)
+    params = LanhuExtractor.parse_url(url, require_team_id=False)
     return params.get('project_id', '')
 
 
-async def _fetch_metadata_from_url(url: str) -> dict:
+async def _fetch_metadata_from_url(url: str, cookies: dict) -> dict:
     """
     从蓝湖URL获取标准元数据（10个字段）- 支持基于版本号的永久缓存
     
@@ -2208,9 +2846,10 @@ async def _fetch_metadata_from_url(url: str) -> dict:
         'doc_url': None
     }
     
-    extractor = LanhuExtractor()
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
+    cache_scope = _get_cookie_cache_scope(cookies)
     try:
-        params = extractor.parse_url(url)
+        params = await extractor.resolve_url_params(url)
         project_id = params.get('project_id')
         doc_id = params.get('doc_id')
         team_id = params.get('team_id')
@@ -2222,7 +2861,7 @@ async def _fetch_metadata_from_url(url: str) -> dict:
             return metadata
         
         # 生成缓存键
-        cache_key = _get_metadata_cache_key(project_id, doc_id)
+        cache_key = _get_metadata_cache_key(project_id, doc_id, cache_scope=cache_scope)
         
         # 如果有doc_id，获取文档信息和版本号
         version_id = None
@@ -2298,12 +2937,15 @@ class LanhuExtractor:
 
     CACHE_META_FILE = ".lanhu_cache.json"  # 缓存元数据文件名
 
-    def __init__(self):
+    def __init__(self, lanhu_cookie: str, dds_cookie: Optional[str] = None):
+        self.lanhu_cookie = lanhu_cookie
+        self.dds_cookie = dds_cookie or lanhu_cookie
+        self._current_team_id = None
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Referer": "https://lanhuapp.com/web/",
             "Accept": "application/json, text/plain, */*",
-            "Cookie": COOKIE,
+            "Cookie": self.lanhu_cookie,
             "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -2312,13 +2954,15 @@ class LanhuExtractor:
         }
         self.client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers, follow_redirects=True)
 
-    def parse_url(self, url: str) -> dict:
+    @staticmethod
+    def parse_url(url: str, require_team_id: bool = True) -> dict:
         """
         解析蓝湖URL，支持多种格式：
         1. 完整URL: https://lanhuapp.com/web/#/item/project/product?tid=...&pid=...
         2. 完整URL: https://lanhuapp.com/web/#/item/project/stage?tid=...&pid=...
         3. 参数部分: ?tid=...&pid=...
         4. 参数部分（无?）: tid=...&pid=...
+        5. 兼容 teamId: 当缺少 tid 但存在 teamId 时，将 teamId 当作 tid 使用
 
         Args:
             url: 蓝湖URL或参数字符串
@@ -2352,7 +2996,7 @@ class LanhuExtractor:
                 params[key] = value
 
         # 提取必需参数
-        team_id = params.get('tid')
+        team_id = params.get('tid') or params.get('teamId')
         project_id = params.get('pid')
         doc_id = params.get('docId') or params.get('image_id')
         version_id = params.get('versionId')
@@ -2361,8 +3005,8 @@ class LanhuExtractor:
         if not project_id:
             raise ValueError(f"URL parsing failed: missing required param pid (project_id)")
 
-        if not team_id:
-            raise ValueError(f"URL parsing failed: missing required param tid (team_id)")
+        if require_team_id and not team_id:
+            raise ValueError(f"URL parsing failed: missing required param tid/teamId (team_id)")
 
         return {
             'team_id': team_id,
@@ -2370,6 +3014,39 @@ class LanhuExtractor:
             'doc_id': doc_id,
             'version_id': version_id
         }
+
+    @staticmethod
+    def _extract_team_id_from_user_settings(data: dict) -> Optional[str]:
+        result = data.get("result", {})
+        if isinstance(result, str):
+            result = json.loads(result)
+        return result.get("teamStatus", {}).get("team_id")
+
+    async def _fetch_current_team_id(self) -> str:
+        if self._current_team_id:
+            return self._current_team_id
+
+        response = await self.client.get(
+            f"{BASE_URL}/api/account/user_settings",
+            params={"settings_type": "web_main"},
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        if data.get("code") != "00000":
+            raise ValueError(f"Failed to fetch current team_id: {data.get('msg', 'Unknown error')}")
+
+        team_id = self._extract_team_id_from_user_settings(data)
+        if not team_id:
+            raise ValueError("Failed to fetch current team_id: missing result.teamStatus.team_id")
+        self._current_team_id = team_id
+        return team_id
+
+    async def resolve_url_params(self, url: str) -> dict:
+        params = self.parse_url(url, require_team_id=False)
+        if not params.get("team_id"):
+            params["team_id"] = await self._fetch_current_team_id()
+        return params
 
     async def get_document_info(self, project_id: str, doc_id: str) -> dict:
         """获取文档信息"""
@@ -2481,7 +3158,7 @@ class LanhuExtractor:
 
     async def get_pages_list(self, url: str) -> dict:
         """获取文档的所有页面列表（仅包含sitemap中的页面，与Web界面一致）"""
-        params = self.parse_url(url)
+        params = await self.resolve_url_params(url)
         doc_info = await self.get_document_info(params['project_id'], params['doc_id'])
 
         # 获取项目详细信息（包含创建者等信息）
@@ -2659,7 +3336,7 @@ class LanhuExtractor:
                 'output_dir': 输出目录
             }
         """
-        params = self.parse_url(url)
+        params = await self.resolve_url_params(url)
         doc_info = await self.get_document_info(params['project_id'], params['doc_id'])
 
         # 获取项目级mapping JSON
@@ -2938,6 +3615,102 @@ class LanhuExtractor:
         )
         # Figma 设计：bitmapLayer(hasExportImage=True) 才是真切图，shapeLayer 的 ddsImage 是图片填充层
         is_figma = (meta.get('host') or {}).get('name') == 'figma'
+
+        panel_slice_index = _extract_lanhu_slice_index(sketch_data)
+        if panel_slice_index:
+            slices = []
+            for item in panel_slice_index:
+                image_data = item.get('image') if isinstance(item.get('image'), dict) else {}
+                images_data = item.get('images') if isinstance(item.get('images'), dict) else {}
+                download_url = _lanhu_slice_list_src(item)
+                svg_url = item.get('svgUrl') or item.get('svg')
+
+                logical_w = item.get('width') or 0
+                logical_h = item.get('height') or 0
+                img_size = image_data.get('size') or {}
+                if img_size.get('width') and img_size.get('height'):
+                    logical_w = img_size.get('width')
+                    logical_h = img_size.get('height')
+
+                width = int(round(float(item.get('width') or 0)))
+                height = int(round(float(item.get('height') or 0)))
+                slice_info = {
+                    'id': item.get('web_id'),
+                    'name': item.get('name') or '',
+                    'type': 'ps-slice' if images_data else 'slice',
+                    'download_url': download_url,
+                    'size': f"{width}x{height}",
+                    'format': 'svg' if download_url == svg_url and not (item.get('imageUrl') or item.get('url')) else 'png',
+                    'has_svg': bool(item.get('hasSvg')),
+                    'slice_list_src': download_url,
+                    'visible_in_slice_list': {
+                        'PNG': _lanhu_visible_in_slice_list(item, 'PNG'),
+                        'JPG': _lanhu_visible_in_slice_list(item, 'JPG'),
+                        'WebP': _lanhu_visible_in_slice_list(item, 'WebP'),
+                        'SVG': _lanhu_visible_in_slice_list(item, 'SVG'),
+                        'PDF': _lanhu_visible_in_slice_list(item, 'PDF'),
+                    },
+                }
+
+                if svg_url:
+                    slice_info['svg_url'] = svg_url
+
+                if item.get('left') is not None or item.get('top') is not None:
+                    slice_info['position'] = {
+                        'x': int(round(float(item.get('left') or 0))),
+                        'y': int(round(float(item.get('top') or 0))),
+                    }
+
+                if images_data and images_data.get('png_xxxhd'):
+                    scale_urls = self._build_ps_scale_urls(
+                        images_data.get('png_xxxhd'),
+                        item.get('width') or logical_w,
+                        item.get('height') or logical_h,
+                    )
+                    if scale_urls:
+                        slice_info['scale_urls'] = scale_urls
+                    slice_info['base_size'] = {
+                        'width': int(round(float(item.get('width') or logical_w or 0))),
+                        'height': int(round(float(item.get('height') or logical_h or 0))),
+                        'note': 'PS slice base px; equals iOS @2x / Android xhdpi',
+                    }
+                    slice_info['logical_size'] = {
+                        'width': int(round(float((item.get('width') or logical_w or 0) / 2))),
+                        'height': int(round(float((item.get('height') or logical_h or 0) / 2))),
+                        'note': '1x logical px; PS slice base px equals iOS @2x / Android xhdpi',
+                    }
+                elif download_url and logical_w and logical_h and slice_info['format'] == 'png':
+                    scale_urls = self._build_scale_urls(download_url, logical_w, logical_h, slice_scale)
+                    if scale_urls:
+                        slice_info['scale_urls'] = scale_urls
+                    slice_info['logical_size'] = {
+                        'width': int(round(float(logical_w))),
+                        'height': int(round(float(logical_h))),
+                        'note': f'1x logical px; stored at {slice_scale}x = {int(round(float(logical_w) * slice_scale))}x{int(round(float(logical_h) * slice_scale))}px'
+                    }
+
+                if include_metadata:
+                    slice_info['metadata'] = {
+                        'source': 'lanhu_slice_list',
+                        'slice_index': item.get('index'),
+                        'web_id': item.get('web_id'),
+                        'hasSvg': bool(item.get('hasSvg')),
+                    }
+
+                slices.append(slice_info)
+
+            return {
+                'design_id': image_id,
+                'design_name': result['name'],
+                'version': latest_version['version_info'],
+                'slice_scale': slice_scale,
+                'canvas_size': {
+                    'width': result.get('width'),
+                    'height': result.get('height')
+                },
+                'total_slices': len(slices),
+                'slices': slices
+            }
 
         # 3. 递归提取所有切图
         slices = []
@@ -3310,7 +4083,7 @@ class LanhuExtractor:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://dds.lanhuapp.com/",
-            "Cookie": DDS_COOKIE,
+            "Cookie": self.dds_cookie,
             "Authorization": "Basic dW5kZWZpbmVkOg==",
         }
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=dds_headers, follow_redirects=True) as dds_client:
@@ -3789,8 +4562,10 @@ async def lanhu_resolve_invite_link(
     """
     try:
         # 解析Cookie字符串为playwright格式
+        resolved_cookies = get_current_lanhu_cookies()
+        lanhu_cookie = resolved_cookies["lanhu_cookie"]
         cookies = []
-        for cookie_str in COOKIE.split('; '):
+        for cookie_str in lanhu_cookie.split('; '):
             if '=' in cookie_str:
                 name, value = cookie_str.split('=', 1)
                 cookies.append({
@@ -3823,9 +4598,12 @@ async def lanhu_resolve_invite_link(
             await browser.close()
             
             # 解析最终URL
-            extractor = LanhuExtractor()
             try:
-                params = extractor.parse_url(final_url)
+                extractor = LanhuExtractor(lanhu_cookie, resolved_cookies.get("dds_cookie"))
+                try:
+                    params = await extractor.resolve_url_params(final_url)
+                finally:
+                    await extractor.close()
                 
                 return {
                     "status": "success",
@@ -3842,9 +4620,10 @@ async def lanhu_resolve_invite_link(
                     "parse_error": str(e),
                     "message": "URL resolved but parsing failed. You can try using the resolved_url directly."
                 }
-            finally:
-                await extractor.close()
-                
+    except LanhuCookieNotConfigured as e:
+        result = lanhu_cookie_error_response(e)
+        result["invite_url"] = invite_url
+        return result
     except Exception as e:
         return {
             "status": "error",
@@ -3929,7 +4708,7 @@ def _get_analysis_mode_options_by_role(user_role: str) -> str:
 
 @mcp.tool()
 async def lanhu_get_pages(
-    url: Annotated[str, "Lanhu URL with docId parameter (indicates PRD/prototype document). Example: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx. Required params: tid, pid, docId. If you have an invite link, use lanhu_resolve_invite_link first!"],
+    url: Annotated[str, "Lanhu URL with docId parameter (indicates PRD/prototype document). Example: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx. Required params: pid, docId; tid/teamId is optional and will be fetched from current account settings when missing. If you have an invite link, use lanhu_resolve_invite_link first!"],
     ctx: Context = None
 ) -> dict:
     """
@@ -3943,7 +4722,12 @@ async def lanhu_get_pages(
     Returns:
         Page list and document metadata
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -4596,7 +5380,12 @@ async def lanhu_get_ai_analyze_page_result(
           When generating code, you MUST use these exact color/font/size values from
           [设计样式参考] instead of guessing. For images, use the local file paths provided.
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
 
     try:
         # 记录协作者
@@ -4607,12 +5396,11 @@ async def lanhu_get_ai_analyze_page_result(
             store.record_collaborator(user_name, user_role)
         
         # 解析URL获取文档ID
-        params = extractor.parse_url(url)
+        params = await extractor.resolve_url_params(url)
         doc_id = params['doc_id']
 
         # 设置输出目录（内部实现，自动管理）
-        resource_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}")
-        output_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}_screenshots")
+        resource_dir, output_dir = _get_axure_cache_dirs(doc_id, cookies)
 
         # 下载资源（支持智能缓存）
         download_result = await extractor.download_resources(url, resource_dir)
@@ -4847,7 +5635,7 @@ async def lanhu_get_ai_analyze_page_result(
 async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
     """内部函数：获取设计图列表"""
     # 解析URL获取参数
-    params = extractor.parse_url(url)
+    params = await extractor.resolve_url_params(url)
 
     # 构建获取设计图列表的API URL
     api_url = (
@@ -4895,7 +5683,7 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
 
 @mcp.tool()
 async def lanhu_get_designs(
-    url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project, not PRD). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx. Required params: tid, pid (NO docId)"],
+    url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project, not PRD). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx. Required params: pid (NO docId); tid/teamId is optional and will be fetched from current account settings when missing."],
     ctx: Context = None
 ) -> dict:
     """
@@ -4910,7 +5698,12 @@ async def lanhu_get_designs(
     Returns:
         Design image list and project metadata
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -5066,7 +5859,12 @@ async def lanhu_get_ai_analyze_design_result(
         DESIGN IMAGE is for visual verification ONLY. It has the LOWEST priority.
         NEVER use the design image to override any CSS value from the HTML+CSS code.
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -5076,7 +5874,7 @@ async def lanhu_get_ai_analyze_design_result(
             store.record_collaborator(user_name, user_role)
         
         # 解析URL获取参数
-        params = extractor.parse_url(url)
+        params = await extractor.resolve_url_params(url)
 
         # 获取设计图列表
         designs_data = await _get_designs_internal(extractor, url)
@@ -5131,7 +5929,7 @@ async def lanhu_get_ai_analyze_design_result(
                 f"⚠️ No matching design found\n\nAvailable designs:\n" + "\n".join(f"  • {name}" for name in available_names)]
 
         # 设置输出目录（内部实现，自动管理）
-        output_dir = DATA_DIR / 'lanhu_designs' / params['project_id']
+        output_dir = _get_design_cache_dir(params['project_id'], cookies)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # 下载设计图并生成HTML
@@ -5488,7 +6286,12 @@ async def lanhu_get_design_slices(
     Returns:
         Slice list with download URLs, AI will handle smart naming and batch download
     """
-    extractor = LanhuExtractor()
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
+    extractor = LanhuExtractor(cookies["lanhu_cookie"], cookies.get("dds_cookie"))
     try:
         # 记录协作者
         user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
@@ -5507,7 +6310,7 @@ async def lanhu_get_design_slices(
             }
 
         # 2. 解析URL获取参数（提前解析，用于后续匹配和 API 调用）
-        params = extractor.parse_url(url)
+        params = await extractor.resolve_url_params(url)
         image_id_from_url = params.get('doc_id')  # parse_url 会把 image_id 解析为 doc_id
 
         # 3. 查找指定的设计图
@@ -5762,7 +6565,7 @@ async def lanhu_get_design_slices(
 
 @mcp.tool()
 async def lanhu_say(
-        url: Annotated[str, "蓝湖URL（含tid和pid）。例: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx。会自动提取项目和文档信息"],
+        url: Annotated[str, "蓝湖URL（含pid，tid/teamId可省略，缺失时自动从当前账号设置获取）。例: https://lanhuapp.com/web/#/item/project/product?tid=xxx&pid=xxx&docId=xxx。会自动提取项目和文档信息"],
         summary: Annotated[str, "留言标题/概要"],
         content: Annotated[str, "留言详细内容"],
         mentions: Annotated[Optional[List[str]], "⚠️@提醒人名。必须是具体人名，例如: 张三/李四/王五/赵六等。禁止使用角色名(后端/前端等)！"] = None,
@@ -5802,6 +6605,11 @@ async def lanhu_say(
         Post result, including message ID and details
     """
     # 获取用户信息
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -5810,7 +6618,7 @@ async def lanhu_say(
         return {"status": "error", "message": "无法从URL解析project_id"}
     
     # 获取元数据（自动，带缓存）
-    metadata = await _fetch_metadata_from_url(url)
+    metadata = await _fetch_metadata_from_url(url, cookies)
     
     # 验证message_type
     valid_types = ['normal', 'task', 'question', 'urgent', 'knowledge']
@@ -5840,11 +6648,10 @@ async def lanhu_say(
     store.record_collaborator(user_name, user_role)
     
     # 保存项目元数据到store（如果首次获取到）
-    if metadata.get('project_name') and not store._data.get('project_name'):
-        store._data['project_name'] = metadata['project_name']
-    if metadata.get('folder_name') and not store._data.get('folder_name'):
-        store._data['folder_name'] = metadata['folder_name']
-    store._save()
+    store.update_project_metadata(
+        project_name=metadata.get('project_name'),
+        folder_name=metadata.get('folder_name'),
+    )
     
     message = store.save_message(
         summary=summary,
@@ -5941,6 +6748,11 @@ async def lanhu_say_list(
         Message list, including mentions_me count
     """
     # 获取用户信息
+    try:
+        get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 验证filter_type
@@ -6191,6 +7003,11 @@ async def lanhu_say_detail(
         Message detail list with full content
     """
     # 获取用户信息
+    try:
+        get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 确定project_id
@@ -6240,7 +7057,7 @@ async def lanhu_say_detail(
 
 @mcp.tool()
 async def lanhu_say_edit(
-        url: Annotated[str, "蓝湖URL（含tid和pid）"],
+        url: Annotated[str, "蓝湖URL（含pid，tid/teamId可省略，缺失时自动从当前账号设置获取）"],
         message_id: Annotated[Any, "要编辑的消息ID"],
         summary: Annotated[Optional[str], "新标题（可选，不传则不修改）"] = None,
         content: Annotated[Optional[str], "新内容（可选，不传则不修改）"] = None,
@@ -6258,6 +7075,11 @@ async def lanhu_say_edit(
         Updated message details
     """
     # 获取用户信息
+    try:
+        cookies = get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6304,7 +7126,7 @@ async def lanhu_say_edit(
     # 发送飞书编辑通知
     try:
         # 获取元数据
-        metadata = await _fetch_metadata_from_url(url)
+        metadata = await _fetch_metadata_from_url(url, cookies)
         
         await send_feishu_notification(
             summary=f"🔄 [已编辑] {updated_msg.get('summary', '')}",
@@ -6329,7 +7151,7 @@ async def lanhu_say_edit(
 
 @mcp.tool()
 async def lanhu_say_delete(
-        url: Annotated[str, "蓝湖URL（含tid和pid）"],
+        url: Annotated[str, "蓝湖URL（含pid，tid/teamId可省略，缺失时自动从当前账号设置获取）"],
         message_id: Annotated[Any, "要删除的消息ID"],
         ctx: Context = None
 ) -> dict:
@@ -6344,6 +7166,11 @@ async def lanhu_say_delete(
         Delete result
     """
     # 获取用户信息
+    try:
+        get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6377,7 +7204,7 @@ async def lanhu_say_delete(
 
 @mcp.tool()
 async def lanhu_get_members(
-    url: Annotated[str, "蓝湖URL（含tid和pid）"],
+    url: Annotated[str, "蓝湖URL（含pid，tid/teamId可省略，缺失时自动从当前账号设置获取）"],
     ctx: Context = None
 ) -> dict:
     """
@@ -6391,6 +7218,11 @@ async def lanhu_get_members(
         Collaborator list with first and last access time
     """
     # 获取用户信息
+    try:
+        get_current_lanhu_cookies()
+    except LanhuCookieNotConfigured as e:
+        return lanhu_cookie_error_response(e)
+
     user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
     
     # 获取project_id
@@ -6420,8 +7252,11 @@ async def health_check(request):
 if __name__ == "__main__":
     # 运行MCP服务器
     # 使用HTTP传输方式，支持环境变量配置
-    SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-    SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
-    mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
-
+    MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http").lower()
+    if MCP_TRANSPORT == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+        SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+        mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
 

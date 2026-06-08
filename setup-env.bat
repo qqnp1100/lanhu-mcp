@@ -56,13 +56,15 @@ echo # ==============================================
 echo.
 echo # 蓝湖 Cookie（必需）
 echo LANHU_COOKIE="your_lanhu_cookie_here"
+echo DDS_COOKIE=""
+echo MCP_TRANSPORT="http"
 echo.
 echo # ==============================================
 echo # 服务器配置（可选）
 echo # ==============================================
 echo.
 echo # 服务器主机地址
-echo SERVER_HOST="0.0.0.0"
+echo SERVER_HOST="127.0.0.1"
 echo.
 echo # 服务器端口
 echo SERVER_PORT=8000

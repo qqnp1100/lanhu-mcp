@@ -280,7 +280,26 @@ docker-compose down              # 停止
 {
   "mcpServers": {
     "lanhu": {
-      "url": "http://localhost:8000/mcp?role=Developer&name=YourName"
+      "command": "python",
+      "args": ["E:/AiProject/lanhu-mcp/lanhu_mcp_server.py"],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "LANHU_COOKIE": "your_lanhu_cookie_here"
+      }
+    }
+  }
+}
+```
+
+**HTTP（推荐共享服务多用户使用，每个用户在 headers 中传自己的 Cookie）：**
+```json
+{
+  "mcpServers": {
+    "lanhu": {
+      "url": "http://localhost:8000/mcp?role=Developer&name=YourName",
+      "headers": {
+        "X-Lanhu-Cookie": "your_lanhu_cookie_here"
+      }
     }
   }
 }
@@ -290,6 +309,7 @@ docker-compose down              # 停止
 > - `role`: 用户角色（Developer/Frontend/Backend/Tester/Product 等）
 > - `name`: 用户姓名（用于协作追踪和 @提醒）
 > - ⚠️ **注意**：部分 AI 开发工具不支持 URL 中使用中文参数值，建议使用英文
+> - 不要把 Cookie 放在 URL query 参数中；stdio 用 `env.LANHU_COOKIE`，HTTP 用 `headers.X-Lanhu-Cookie`
 
 ## 🎯 提升 UI 还原度
 
@@ -330,6 +350,20 @@ https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx
 ```
 
 分析结果包含设计图预览、详细参数（尺寸/间距/颜色/字体等）以及转换后的 HTML+CSS 代码，便于还原实现。
+
+### 本地 Sketch JSON 生成 HTML
+
+仓库内置了一个调试脚本，可将 `tests/` 下的蓝湖 Sketch JSON 转换为 HTML：
+
+```powershell
+docker run --rm -v ${PWD}:/app -w /app lanhu-mcp-lanhu-mcp:latest python tests/generate_sketch_html.py
+```
+
+也可以指定输入 JSON 和输出 HTML：
+
+```powershell
+python tests/generate_sketch_html.py path\to\input.json -o path\to\output.html
+```
 
 ### 切图下载
 

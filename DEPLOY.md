@@ -85,11 +85,32 @@ docker logs lanhu-mcp | grep "Server started"
 - Linux: `~/.config/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
 
 **配置内容:**
+
+**stdio（单用户本地进程，Cookie 放 env）：**
 ```json
 {
   "mcpServers": {
     "lanhu": {
-      "url": "http://localhost:8000/mcp?role=Backend&name=John"
+      "command": "python",
+      "args": ["E:/AiProject/lanhu-mcp/lanhu_mcp_server.py"],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "LANHU_COOKIE": "your_lanhu_cookie_here"
+      }
+    }
+  }
+}
+```
+
+**HTTP（共享服务多用户，Cookie 放 headers）：**
+```json
+{
+  "mcpServers": {
+    "lanhu": {
+      "url": "http://localhost:8000/mcp?role=Backend&name=John",
+      "headers": {
+        "X-Lanhu-Cookie": "your_lanhu_cookie_here"
+      }
     }
   }
 }
@@ -99,6 +120,7 @@ docker logs lanhu-mcp | grep "Server started"
 - `role`: 你的角色（Backend/Frontend/Tester/Product 等）
 - `name`: 你的姓名（用于团队协作和 @提醒）
 - ⚠️ **兼容性提示**：部分 AI 开发工具不支持 URL 中文参数，建议使用英文
+- 不要把 Cookie 放在 URL query 参数中；stdio 使用 `env.LANHU_COOKIE`，HTTP 使用 `headers.X-Lanhu-Cookie`
 
 ### Claude Desktop 配置
 
@@ -108,7 +130,10 @@ docker logs lanhu-mcp | grep "Server started"
 {
   "mcpServers": {
     "lanhu": {
-      "url": "http://localhost:8000/mcp?role=Developer&name=Jane"
+      "url": "http://localhost:8000/mcp?role=Developer&name=Jane",
+      "headers": {
+        "X-Lanhu-Cookie": "your_lanhu_cookie_here"
+      }
     }
   }
 }
