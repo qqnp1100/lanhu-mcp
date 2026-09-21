@@ -54,7 +54,7 @@ DEFAULT_COOKIE = "your_lanhu_cookie_here"  # 请替换为你的蓝湖Cookie，�
 BASE_URL = "https://lanhuapp.com"
 DDS_BASE_URL = "https://dds.lanhuapp.com"
 CDN_URL = "https://axure-file.lanhuapp.com"
-LANHU_COOKIE_HEADER_NAMES = ("X-Lanhu-Cookie", "Lanhu-Cookie", "LANHU_COOKIE")
+LANHU_COOKIE_HEADER_NAMES = ("X-Lanhu-Cookie", "Authorization", "Lanhu-Cookie", "LANHU_COOKIE")
 DDS_COOKIE_HEADER_NAMES = ("X-Lanhu-DDS-Cookie", "DDS_COOKIE")
 
 # 飞书机器人Webhook配置（支持环境变量）
@@ -2742,7 +2742,7 @@ def get_current_lanhu_cookies() -> dict:
     Resolve cookies for the current MCP call.
 
     Priority:
-    1. HTTP request headers (for shared HTTP MCP servers)
+    1. HTTP request headers: X-Lanhu-Cookie, Authorization, then legacy aliases
     2. Process environment variables (for stdio or single-user fallback)
     """
     lanhu_cookie = _get_http_header_value(LANHU_COOKIE_HEADER_NAMES)
@@ -7259,4 +7259,3 @@ if __name__ == "__main__":
         SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
         SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
         mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
-

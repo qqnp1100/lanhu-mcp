@@ -131,6 +131,36 @@ def test_headers_override_environment_cookie(server, monkeypatch):
     }
 
 
+@pytest.mark.parametrize("primary_cookie", [None, "", "   ", '""'])
+def test_authorization_cookie_fallback(server, monkeypatch, primary_cookie):
+    monkeypatch.setenv("LANHU_COOKIE", "env-cookie")
+    headers = {"authorization": "auth-cookie", "Lanhu-Cookie": "legacy-cookie"}
+    if primary_cookie is not None:
+        headers["X-Lanhu-Cookie"] = primary_cookie
+    _set_request_headers(monkeypatch, headers)
+
+    assert server.get_current_lanhu_cookies() == {
+        "lanhu_cookie": "auth-cookie",
+        "dds_cookie": "auth-cookie",
+    }
+
+
+def test_primary_cookie_takes_priority_over_authorization(server, monkeypatch):
+    _set_request_headers(
+        monkeypatch,
+        {"X-Lanhu-Cookie": "primary-cookie", "Authorization": "auth-cookie"},
+    )
+
+    assert server.get_current_lanhu_cookies()["lanhu_cookie"] == "primary-cookie"
+
+
+def test_empty_cookie_headers_fall_back_to_environment(server, monkeypatch):
+    monkeypatch.setenv("LANHU_COOKIE", "env-cookie")
+    _set_request_headers(monkeypatch, {"X-Lanhu-Cookie": "", "Authorization": "   "})
+
+    assert server.get_current_lanhu_cookies()["lanhu_cookie"] == "env-cookie"
+
+
 def test_dds_env_cookie_is_used_when_header_is_missing(server, monkeypatch):
     monkeypatch.setenv("LANHU_COOKIE", "env-cookie")
     monkeypatch.setenv("DDS_COOKIE", "env-dds-cookie")
