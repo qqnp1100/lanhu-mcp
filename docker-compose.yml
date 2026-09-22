@@ -41,6 +41,8 @@ networks:
 #
 # 2. 启动服务：
 #    docker-compose up -d
+#    重启服务：
+#    docker compose restart lanhu-mcp
 #
 # 3. 查看日志：
 #    docker-compose logs -f lanhu-mcp
